@@ -1,0 +1,15 @@
+[package]
+name = "ai-memory-wiki"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Markdown wiki read/write, file watcher and git versioning."
+
+[dependencies]
+ai-memory-core.workspace = true
+
+[lints]
+workspace = true

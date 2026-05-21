@@ -1,0 +1,15 @@
+[package]
+name = "ai-memory-consolidate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Karpathy-style ingest / query / lint consolidation pipeline."
+
+[dependencies]
+ai-memory-core.workspace = true
+
+[lints]
+workspace = true

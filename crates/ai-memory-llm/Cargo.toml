@@ -1,0 +1,15 @@
+[package]
+name = "ai-memory-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LLM provider trait with typed Anthropic, OpenAI and OpenAI-compat clients."
+
+[dependencies]
+ai-memory-core.workspace = true
+
+[lints]
+workspace = true

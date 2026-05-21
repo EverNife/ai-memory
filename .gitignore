@@ -1,0 +1,25 @@
+# Rust build artefacts.
+/target/
+**/*.rs.bk
+**/*.rs.orig
+
+# Local environment overrides.
+.env
+.env.local
+/.local-data/
+
+# Editor / OS noise.
+.DS_Store
+*.tmp
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local debugging.
+*.log
+flamegraph.svg
+perf.data*
+
+# Sandbox marker (not project content).
+.ai-jail

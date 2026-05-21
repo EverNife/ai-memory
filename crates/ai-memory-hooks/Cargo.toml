@@ -1,0 +1,15 @@
+[package]
+name = "ai-memory-hooks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Hook payload schemas, sanitisation, and HTTP ingress for agent lifecycle hooks."
+
+[dependencies]
+ai-memory-core.workspace = true
+
+[lints]
+workspace = true

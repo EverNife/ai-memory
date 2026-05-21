@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ai-memory-core",
+    "crates/ai-memory-store",
+    "crates/ai-memory-wiki",
+    "crates/ai-memory-mcp",
+    "crates/ai-memory-hooks",
+    "crates/ai-memory-llm",
+    "crates/ai-memory-consolidate",
+    "crates/ai-memory-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/akitaonrails/ai-memory"
+authors = ["Fabio Akita <boss@akitaonrails.com>"]
+
+[workspace.dependencies]
+# Inter-crate dependencies.
+ai-memory-core = { path = "crates/ai-memory-core", version = "0.1.0" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "0.1.0" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "0.1.0" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "0.1.0" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "0.1.0" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "0.1.0" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "0.1.0" }
+
+# Error handling.
+anyhow = "1"
+thiserror = "2"
+
+# Serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Async runtime.
+tokio = { version = "1", features = ["full"] }
+
+# Logging / tracing.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+
+# Time & IDs.
+jiff = { version = "0.2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+# Config & CLI.
+figment = { version = "0.10", features = ["toml", "env"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+
+# Secrets.
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Testing.
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Pedantic is opt-in per-crate once code stabilises; too noisy for early skeleton.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

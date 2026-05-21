@@ -1,0 +1,183 @@
+//! Strongly-typed identifiers for the domain.
+//!
+//! The 3-tuple ([`WorkspaceId`], [`ProjectId`], [`PagePath`]) is the universal
+//! identity coordinate for any memory. It is baked in from M0 even though v1
+//! ships single-workspace, so we never inherit basic-memory's v0.20 retrofit
+//! pain (issues #783, #834, #802 and friends — see
+//! `docs/issues-basic-memory.md`).
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::error::MemoryError;
+
+macro_rules! id_newtype {
+    ($vis:vis $name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        $vis struct $name(pub Uuid);
+
+        impl $name {
+            /// Generate a fresh v7 (time-ordered) identifier.
+            #[must_use]
+            pub fn new() -> Self {
+                Self(Uuid::now_v7())
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&self.0).finish()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = MemoryError;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Uuid::from_str(s)
+                    .map(Self)
+                    .map_err(|e| MemoryError::MalformedRecord(format!("invalid uuid: {e}")))
+            }
+        }
+    };
+}
+
+id_newtype!(pub WorkspaceId, "Workspace identifier (top of the 3-tuple).");
+id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
+id_newtype!(pub SessionId, "Identifier for a single agent run.");
+id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
+
+/// Relative path of a page within the wiki tree.
+///
+/// Always uses `/` as the separator (POSIX-style), normalised on construction.
+/// Never starts with a slash; never contains `..` or `.` components. This
+/// invariant lets the store treat paths as flat keys without re-validating.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PagePath(String);
+
+impl PagePath {
+    /// Construct from a raw string. Rejects empty, leading-slash, and
+    /// dot-segment paths.
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::InvalidPagePath`] when the input is empty or
+    /// contains a path component that would escape or alias the wiki root.
+    pub fn new(raw: impl Into<String>) -> Result<Self, MemoryError> {
+        let raw = raw.into();
+        if raw.is_empty() {
+            return Err(MemoryError::InvalidPagePath("empty path".into()));
+        }
+        if raw.starts_with('/') {
+            return Err(MemoryError::InvalidPagePath(format!(
+                "leading slash: {raw}"
+            )));
+        }
+        for segment in raw.split('/') {
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return Err(MemoryError::InvalidPagePath(format!(
+                    "invalid segment in {raw}"
+                )));
+            }
+        }
+        Ok(Self(raw))
+    }
+
+    /// Borrow the inner string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PagePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PagePath").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for PagePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Discriminator for the agent CLI that captured an observation or handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentKind {
+    /// Anthropic Claude Code CLI.
+    ClaudeCode,
+    /// OpenAI Codex CLI.
+    Codex,
+    /// OpenCode (open-source coding agent).
+    OpenCode,
+    /// Anything else (manual capture, future agents).
+    Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_path_accepts_simple() {
+        assert_eq!(PagePath::new("foo/bar.md").unwrap().as_str(), "foo/bar.md");
+    }
+
+    #[test]
+    fn page_path_rejects_empty() {
+        assert!(PagePath::new("").is_err());
+    }
+
+    #[test]
+    fn page_path_rejects_leading_slash() {
+        assert!(PagePath::new("/foo").is_err());
+    }
+
+    #[test]
+    fn page_path_rejects_dot_segments() {
+        assert!(PagePath::new("a/./b").is_err());
+        assert!(PagePath::new("a/../b").is_err());
+    }
+
+    #[test]
+    fn ids_are_unique() {
+        let a = WorkspaceId::new();
+        let b = WorkspaceId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn id_round_trips_through_string() {
+        let id = SessionId::new();
+        let s = id.to_string();
+        let parsed: SessionId = s.parse().unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn agent_kind_serde() {
+        let k = AgentKind::ClaudeCode;
+        let s = serde_json::to_string(&k).unwrap();
+        assert_eq!(s, "\"claude-code\"");
+        let back: AgentKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, k);
+    }
+}
