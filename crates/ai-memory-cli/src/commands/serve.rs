@@ -142,10 +142,31 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
             let server_clone = server.clone();
+            // `Host`-header allowlist for rmcp's DNS-rebinding guard.
+            // Precedence: AI_MEMORY_ALLOWED_HOSTS env (comma-separated)
+            // overrides config.allowed_hosts entirely; both default to
+            // loopback. Matches the AI_MEMORY_AUTH_TOKEN env-overrides-
+            // config pattern just below.
+            let allowed_hosts: Vec<String> = std::env::var("AI_MEMORY_ALLOWED_HOSTS")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| config.allowed_hosts.clone());
+            info!(
+                allowed_hosts = ?allowed_hosts,
+                "MCP Host-header allowlist"
+            );
             let mcp_service = StreamableHttpService::new(
                 move || Ok(server_clone.clone()),
                 LocalSessionManager::default().into(),
-                StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token()),
+                StreamableHttpServerConfig::default()
+                    .with_cancellation_token(cancel.child_token())
+                    .with_allowed_hosts(allowed_hosts),
             );
             let hooks = hook_router(HookState {
                 workspace_id: ws,

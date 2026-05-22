@@ -49,6 +49,13 @@ pub struct Config {
     /// `AI_MEMORY_AUTH_TOKEN` env var or `[auth].bearer_token` in
     /// config.toml.
     pub auth: AuthSettings,
+    /// `Host`-header allowlist for the MCP transport. rmcp's
+    /// `StreamableHttpService` rejects any inbound request whose
+    /// `Host` header doesn't match this list (DNS-rebinding defence).
+    /// Default is loopback only; to expose ai-memory on a LAN
+    /// IP / `home.lan` / etc., add that authority here or pass it via
+    /// `AI_MEMORY_ALLOWED_HOSTS=host1,host2,…` at startup.
+    pub allowed_hosts: Vec<String>,
 }
 
 /// `[auth]` section of `config.toml`.
@@ -70,6 +77,7 @@ impl Default for Config {
             decay: ai_memory_store::DecayParams::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
+            allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
         }
     }
 }

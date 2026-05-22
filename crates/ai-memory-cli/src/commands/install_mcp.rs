@@ -63,7 +63,15 @@ fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
     }
     let home = dirs::home_dir().context("could not locate $HOME for config-file auto-detect")?;
     Ok(match args.client {
-        McpClient::ClaudeCode => home.join(".claude").join("settings.json"),
+        // Claude Code reads MCP-server registrations from `~/.claude.json`
+        // (the same file `claude mcp add`/`claude mcp list` operate on).
+        // `~/.claude/settings.json` is a separate file for hooks /
+        // permissions / etc. — putting `mcpServers` there does NOT make
+        // Claude Code load the server. (Confirmed against CC 1.x by
+        // observing that `mcpServers` in settings.json is silently
+        // ignored while the same entry under `~/.claude.json` shows up
+        // in `claude mcp list`.)
+        McpClient::ClaudeCode => home.join(".claude.json"),
         McpClient::Codex => home.join(".codex").join("config.toml"),
         McpClient::OpenCode => home.join(".config").join("opencode").join("opencode.json"),
         McpClient::Cursor => home.join(".cursor").join("mcp.json"),
@@ -147,18 +155,7 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
             })
         })?,
         McpClient::Codex => apply_atomic(&path, |existing| {
-            mutate_toml(existing, |doc| {
-                // `[mcp_servers.<name>]` table.
-                let bearer = bearer_header_value_shared(args.auth_token.as_deref());
-                let key = format!("mcp_servers.{}", args.name);
-                let _ = key; // (used in the comment above; toml_edit indexes via [] chain)
-                doc["mcp_servers"][&args.name]["url"] = toml_edit::value(args.server_url.clone());
-                if let Some(b) = bearer {
-                    doc["mcp_servers"][&args.name]["headers"]["Authorization"] =
-                        toml_edit::value(b);
-                }
-                Ok(())
-            })
+            mutate_toml(existing, |doc| codex_upsert_mcp_server(doc, args))
         })?,
         McpClient::Pi => unreachable!("pi guarded above"),
     };
@@ -247,6 +244,60 @@ fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> 
 /// takes a raw `Option<&str>` so other commands can call it too.
 fn bearer_header_value(args: &InstallMcpArgs) -> Option<String> {
     bearer_header_value_shared(args.auth_token.as_deref())
+}
+
+/// Insert / replace `[mcp_servers.<name>]` in a Codex `config.toml`.
+///
+/// Codex parses both forms (block-style `[mcp_servers.foo]` and the
+/// dotted-inline `mcp_servers = { foo = { ... } }`), but its docs show
+/// the block form and that's the only one humans want to read. This
+/// helper canonicalises to the block form even when the file currently
+/// stores `mcp_servers` as an inline table — siblings are preserved.
+fn codex_upsert_mcp_server(
+    doc: &mut toml_edit::DocumentMut,
+    args: &InstallMcpArgs,
+) -> anyhow::Result<()> {
+    use toml_edit::{Item, Table, Value, value};
+
+    let bearer = bearer_header_value_shared(args.auth_token.as_deref());
+
+    // Capture sibling entries from either inline-table or block-table
+    // storage so we can rebuild in block form without dropping them.
+    let preserved: Vec<(String, Item)> = match doc.get("mcp_servers") {
+        Some(Item::Table(t)) => t
+            .iter()
+            .filter(|(k, _)| *k != args.name.as_str())
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+        Some(Item::Value(Value::InlineTable(it))) => it
+            .iter()
+            .filter(|(k, _)| *k != args.name.as_str())
+            .map(|(k, v)| (k.to_string(), Item::Value(v.clone())))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // Build our `[mcp_servers.<name>]` as a block-style table.
+    let mut server = Table::new();
+    server["url"] = value(args.server_url.clone());
+    if let Some(b) = bearer {
+        let mut headers = Table::new();
+        headers["Authorization"] = value(b);
+        server["headers"] = Item::Table(headers);
+    }
+
+    // Replace `mcp_servers` wholesale with a fresh implicit parent
+    // table. Implicit = render only the dotted `[mcp_servers.<name>]`
+    // headers, never a bare `[mcp_servers]` header.
+    let mut parent = Table::new();
+    parent.set_implicit(true);
+    for (k, v) in preserved {
+        parent.insert(&k, v);
+    }
+    parent.insert(&args.name, Item::Table(server));
+
+    doc.insert("mcp_servers", Item::Table(parent));
+    Ok(())
 }
 
 fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
@@ -557,5 +608,81 @@ mod tests {
         assert!(render_for_test(McpClient::ClaudeDesktop).contains("mcp-remote"));
         assert!(render_for_test(McpClient::Openclaw).contains("\"streamable-http\""));
         assert!(render_for_test(McpClient::Codex).contains("[mcp_servers.ai-memory]"));
+    }
+
+    /// The Codex apply path must emit block-form `[mcp_servers.<name>]`
+    /// headers, NOT a dotted inline-table on one line. Regression
+    /// guard: M22 originally created `mcp_servers = { ai-memory = {...} }`
+    /// because toml_edit auto-vivifies inline tables when you assign
+    /// through `doc["foo"]["bar"]`.
+    #[test]
+    fn codex_apply_writes_block_form_tables() {
+        let args = args_with_token(McpClient::Codex);
+        let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args).unwrap();
+        let out = doc.to_string();
+        assert!(
+            out.contains("[mcp_servers.ai-memory]"),
+            "expected block-form table header, got:\n{out}"
+        );
+        assert!(
+            out.contains("[mcp_servers.ai-memory.headers]"),
+            "expected block-form headers sub-table, got:\n{out}"
+        );
+        assert!(
+            !out.contains("mcp_servers = {"),
+            "found inline-table form (regression):\n{out}"
+        );
+        assert!(out.contains("Bearer test-token-deadbeef"));
+    }
+
+    /// Migrating from the old M22 inline-table form to block form must
+    /// be idempotent — the second apply produces identical output.
+    #[test]
+    fn codex_apply_migrates_inline_form_and_is_idempotent() {
+        let args = args_with_token(McpClient::Codex);
+
+        // Simulate a config.toml in the *old* inline form.
+        let original = "approval_policy = \"on-request\"\n\
+                        mcp_servers = { ai-memory = { url = \"http://old\", \
+                        headers = { Authorization = \"Bearer old\" } } }\n\
+                        \n\
+                        [other]\n\
+                        keep = \"this\"\n";
+        let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args).unwrap();
+        let first = doc.to_string();
+
+        // After migration the inline-table form is gone.
+        assert!(!first.contains("mcp_servers = {"));
+        assert!(first.contains("[mcp_servers.ai-memory]"));
+        // Unrelated content survives.
+        assert!(first.contains("approval_policy"));
+        assert!(first.contains("[other]"));
+        assert!(first.contains("keep = \"this\""));
+
+        // Re-applying produces the same bytes (idempotency contract).
+        let mut doc2: toml_edit::DocumentMut = first.parse().unwrap();
+        codex_upsert_mcp_server(&mut doc2, &args).unwrap();
+        let second = doc2.to_string();
+        assert_eq!(
+            first, second,
+            "second apply must produce identical bytes; diff:\n--- first\n{first}\n--- second\n{second}"
+        );
+    }
+
+    /// Sibling `[mcp_servers.<other>]` entries the user has configured
+    /// (e.g. a different MCP server) must survive an --apply.
+    #[test]
+    fn codex_apply_preserves_sibling_mcp_servers() {
+        let args = args_for(McpClient::Codex);
+        let original = "[mcp_servers.other-server]\n\
+                        url = \"http://other\"\n";
+        let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
+        codex_upsert_mcp_server(&mut doc, &args).unwrap();
+        let out = doc.to_string();
+        assert!(out.contains("[mcp_servers.other-server]"));
+        assert!(out.contains("http://other"));
+        assert!(out.contains("[mcp_servers.ai-memory]"));
     }
 }
