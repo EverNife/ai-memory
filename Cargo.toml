@@ -29,6 +29,8 @@ ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "0.1.0" }
 ai-memory-llm = { path = "crates/ai-memory-llm", version = "0.1.0" }
 ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "0.1.0" }
 
+# (Workspace shared deps follow below)
+
 # Error handling.
 anyhow = "1"
 thiserror = "2"
@@ -49,7 +51,7 @@ tracing-appender = "0.2"
 
 # Time & IDs.
 jiff = { version = "0.2", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 # Config & CLI.
 figment = { version = "0.10", features = ["toml", "env"] }
@@ -78,6 +80,9 @@ axum = "0.8"
 # Backup / restore archive format.
 tar = "0.4"
 flate2 = "1"
+
+# Text munging / hook payload sanitisation.
+regex = "1"
 
 # Testing.
 tempfile = "3"

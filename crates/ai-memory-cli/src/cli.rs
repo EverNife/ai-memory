@@ -45,6 +45,8 @@ pub enum Command {
     Backup(BackupArgs),
     /// Restore a backup tarball into the data directory.
     Restore(RestoreArgs),
+    /// Print (or apply) lifecycle-hook configuration for an agent CLI.
+    InstallHooks(InstallHooksArgs),
 }
 
 /// Arguments for `init`.
@@ -112,6 +114,28 @@ pub struct RestoreArgs {
     /// Overwrite an existing non-empty data dir.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Agent CLI to install hooks for.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum AgentChoice {
+    /// Anthropic Claude Code.
+    ClaudeCode,
+}
+
+/// Arguments for `install-hooks`.
+#[derive(Debug, Args)]
+pub struct InstallHooksArgs {
+    /// Which agent's hooks to render.
+    #[arg(long, value_enum, default_value_t = AgentChoice::ClaudeCode)]
+    pub agent: AgentChoice,
+    /// Filesystem root that contains the vendored hook scripts (defaults
+    /// to the repo's `hooks/` if known, else `/usr/local/share/ai-memory/hooks`).
+    #[arg(long)]
+    pub hooks_dir: Option<PathBuf>,
+    /// Server URL the hooks will POST to.
+    #[arg(long, default_value = "http://127.0.0.1:7777")]
+    pub server_url: String,
 }
 
 /// Transport for the MCP server.

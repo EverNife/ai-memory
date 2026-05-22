@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 ai-memory-core.workspace = true
+ai-memory-hooks.workspace = true
 ai-memory-mcp.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true

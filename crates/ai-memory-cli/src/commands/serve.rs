@@ -1,5 +1,6 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
+use ai_memory_hooks::{HookState, hook_router};
 use ai_memory_mcp::AiMemoryServer;
 use ai_memory_store::Store;
 use ai_memory_wiki::{WatcherHandle, Wiki};
@@ -59,16 +60,28 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
             let server_clone = server.clone();
-            let service = StreamableHttpService::new(
+            let mcp_service = StreamableHttpService::new(
                 move || Ok(server_clone.clone()),
                 LocalSessionManager::default().into(),
                 StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token()),
             );
-            let router = axum::Router::new().nest_service("/mcp", service);
+            let hooks = hook_router(HookState {
+                workspace_id: ws,
+                project_id: proj,
+                writer: store.writer.clone(),
+                reader: store.reader.clone(),
+                wiki: wiki.clone(),
+            });
+            let router = axum::Router::new()
+                .nest_service("/mcp", mcp_service)
+                .merge(hooks);
             let listener = tokio::net::TcpListener::bind(&bind)
                 .await
                 .with_context(|| format!("binding {bind}"))?;
-            info!(%bind, "MCP HTTP server ready (POST /mcp, Ctrl-C to stop)");
+            info!(
+                %bind,
+                "MCP HTTP server ready (POST /mcp, POST /hook, Ctrl-C to stop)",
+            );
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;

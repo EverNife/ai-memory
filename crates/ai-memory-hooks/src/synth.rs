@@ -1,0 +1,184 @@
+//! Rule-based session-page synthesis (no LLM).
+//!
+//! At `SessionEnd` we already have N observation rows for the session.
+//! We turn them into a single markdown page under `wiki/sessions/<id>.md`
+//! using only deterministic heuristics: first-prompt as title, files
+//! touched, tool-call counts. Once the LLM provider lands in M6 we'll
+//! add an opt-in path that re-narrates the page.
+
+use std::collections::BTreeMap;
+
+use ai_memory_core::{
+    NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+};
+use jiff::tz::TimeZone;
+
+/// Build a [`NewPage`] from the observations collected during a session.
+///
+/// The returned page is *always* under `sessions/<session-id>.md` so each
+/// session has a stable URL the user can bookmark.
+#[must_use]
+pub fn synthesize_session_page(
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    observations: &[Observation],
+) -> NewPage {
+    let title = derive_title(observations);
+    let body = render_body(session_id, observations, &title);
+    let path = PagePath::new(format!("sessions/{session_id}.md"))
+        .expect("hard-coded sessions/<uuid>.md is always valid");
+    NewPage {
+        workspace_id,
+        project_id,
+        path,
+        title: title.clone(),
+        body,
+        tier: Tier::Episodic,
+        frontmatter_json: serde_json::json!({
+            "title": title,
+            "session_id": session_id.to_string(),
+            "tier": "episodic",
+        }),
+        pinned: false,
+    }
+}
+
+fn derive_title(observations: &[Observation]) -> String {
+    for obs in observations {
+        if obs.kind == ObservationKind::UserPrompt && !obs.title.is_empty() {
+            return obs.title.clone();
+        }
+    }
+    for obs in observations {
+        if !obs.title.is_empty() {
+            return obs.title.clone();
+        }
+    }
+    "session".to_string()
+}
+
+fn render_body(session_id: SessionId, observations: &[Observation], title: &str) -> String {
+    let mut tool_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut prompts: Vec<&Observation> = Vec::new();
+    let mut start: Option<&Observation> = None;
+    let mut end: Option<&Observation> = None;
+
+    for obs in observations {
+        match obs.kind {
+            ObservationKind::SessionStart => start = Some(obs),
+            ObservationKind::SessionEnd => end = Some(obs),
+            ObservationKind::UserPrompt => prompts.push(obs),
+            ObservationKind::PostToolUse | ObservationKind::PreToolUse if !obs.title.is_empty() => {
+                *tool_counts.entry(obs.title.as_str()).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut buf = String::with_capacity(2048);
+    buf.push_str(&format!("# {title}\n\n"));
+
+    buf.push_str("## Session metadata\n\n");
+    buf.push_str(&format!("- **session_id:** `{session_id}`\n"));
+    if let Some(s) = start {
+        buf.push_str(&format!("- **started_at:** {}\n", human_ts(&s.created_at),));
+    }
+    if let Some(e) = end {
+        buf.push_str(&format!("- **ended_at:** {}\n", human_ts(&e.created_at),));
+    }
+    buf.push_str(&format!("- **observations:** {}\n\n", observations.len()));
+
+    if !prompts.is_empty() {
+        buf.push_str("## Prompts\n\n");
+        for (i, p) in prompts.iter().enumerate() {
+            buf.push_str(&format!("{}. {}\n", i + 1, p.title));
+        }
+        buf.push('\n');
+    }
+
+    if !tool_counts.is_empty() {
+        buf.push_str("## Tool calls\n\n");
+        for (name, count) in &tool_counts {
+            buf.push_str(&format!("- `{name}`: {count}\n"));
+        }
+        buf.push('\n');
+    }
+
+    buf.push_str("## Raw observations\n\n");
+    for obs in observations {
+        buf.push_str(&format!(
+            "- `{}` @ {} — {}\n",
+            obs.kind.as_str(),
+            human_ts(&obs.created_at),
+            obs.title.chars().take(80).collect::<String>(),
+        ));
+    }
+
+    buf.push_str("\n_Synthesised by ai-memory (M3, no-LLM heuristic)._\n");
+    buf
+}
+
+fn human_ts(ts: &jiff::Timestamp) -> String {
+    ts.to_zoned(TimeZone::UTC)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_memory_core::{ObservationId, SessionId};
+    use jiff::Timestamp;
+
+    fn obs(kind: ObservationKind, title: &str) -> Observation {
+        Observation {
+            id: ObservationId::new(),
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind,
+            title: title.into(),
+            body: String::new(),
+            importance: 5,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn title_falls_back_through_kinds() {
+        let no_prompt = vec![obs(ObservationKind::PostToolUse, "Edit")];
+        assert_eq!(derive_title(&no_prompt), "Edit");
+
+        let empty: Vec<Observation> = vec![];
+        assert_eq!(derive_title(&empty), "session");
+
+        let with_prompt = vec![
+            obs(ObservationKind::PostToolUse, "Edit"),
+            obs(ObservationKind::UserPrompt, "fix the auth bug"),
+        ];
+        assert_eq!(derive_title(&with_prompt), "fix the auth bug");
+    }
+
+    #[test]
+    fn body_includes_tool_counts_and_prompts() {
+        let observations = vec![
+            obs(ObservationKind::SessionStart, "session"),
+            obs(ObservationKind::UserPrompt, "build the thing"),
+            obs(ObservationKind::PostToolUse, "Edit"),
+            obs(ObservationKind::PostToolUse, "Edit"),
+            obs(ObservationKind::PostToolUse, "Bash"),
+            obs(ObservationKind::SessionEnd, "session"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            &observations,
+        );
+        assert!(page.title.contains("build the thing"));
+        assert!(page.body.contains("`Edit`: 2"));
+        assert!(page.body.contains("`Bash`: 1"));
+        assert!(page.body.contains("build the thing"));
+    }
+}

@@ -4,7 +4,10 @@
 //! the writer thread would violate the single-writer invariant (see
 //! [`crate::writer`]).
 
-use ai_memory_core::{NewPage, PageId};
+use ai_memory_core::{
+    AgentKind, NewObservation, NewPage, NewSession, ObservationId, ObservationKind, PageId,
+    SessionId,
+};
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -182,6 +185,89 @@ pub fn get_or_create_project(
     };
     tx.commit()?;
     Ok(id)
+}
+
+/// Begin (or re-affirm) a session row keyed on the caller-supplied id.
+/// Idempotent: a second call with the same id leaves the row untouched.
+pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult<()> {
+    let now = Timestamp::now().as_microsecond();
+    let agent = agent_kind_as_str(session.agent_kind);
+    let cwd: Option<String> = session
+        .cwd
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    conn.execute(
+        "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            session.id.as_bytes(),
+            session.workspace_id.as_bytes(),
+            session.project_id.as_bytes(),
+            agent,
+            cwd,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Stamp a session as ended, optionally linking the synthesised summary
+/// page.
+pub fn end_session(
+    conn: &mut Connection,
+    session_id: &SessionId,
+    summary_page_id: Option<&PageId>,
+) -> StoreResult<()> {
+    let now = Timestamp::now().as_microsecond();
+    let page_blob: Option<&[u8]> = summary_page_id.map(|p| &p.as_bytes()[..]);
+    conn.execute(
+        "UPDATE sessions SET ended_at = ?1, summary_page_id = ?2 WHERE id = ?3",
+        params![now, page_blob, session_id.as_bytes()],
+    )?;
+    Ok(())
+}
+
+/// Append a single observation. Caller is expected to have already
+/// inserted the parent session via [`begin_session`].
+pub fn insert_observation(
+    conn: &mut Connection,
+    obs: &NewObservation,
+) -> StoreResult<ObservationId> {
+    let id = ObservationId::new();
+    let now = Timestamp::now().as_microsecond();
+    let kind = observation_kind_as_str(obs.kind);
+    let importance: i64 = i64::from(obs.importance.clamp(1, 10));
+    conn.execute(
+        "INSERT INTO observations \
+         (id, session_id, workspace_id, project_id, kind, title, body, importance, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id.as_bytes(),
+            obs.session_id.as_bytes(),
+            obs.workspace_id.as_bytes(),
+            obs.project_id.as_bytes(),
+            kind,
+            obs.title,
+            obs.body,
+            importance,
+            now,
+        ],
+    )?;
+    Ok(id)
+}
+
+fn agent_kind_as_str(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::ClaudeCode => "claude-code",
+        AgentKind::Codex => "codex",
+        AgentKind::OpenCode => "open-code",
+        AgentKind::Other => "other",
+    }
+}
+
+fn observation_kind_as_str(kind: ObservationKind) -> &'static str {
+    kind.as_str()
 }
 
 fn audit(

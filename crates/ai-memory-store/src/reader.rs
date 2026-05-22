@@ -9,7 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ai_memory_core::{PageId, PagePath};
+use ai_memory_core::{
+    Observation, ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId,
+    WorkspaceId,
+};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
@@ -181,6 +184,33 @@ impl ReaderPool {
         .await
     }
 
+    /// Return all observations for the given session, ordered by
+    /// `created_at` ascending.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn observations_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Vec<Observation>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, workspace_id, project_id, kind, title, body, \
+                        importance, created_at \
+                 FROM observations \
+                 WHERE session_id = ?1 \
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id.as_bytes()], row_to_observation)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Snapshot the database to `dest_path` using SQLite's online backup
     /// API. The source DB stays writable for the duration of the copy.
     ///
@@ -213,6 +243,61 @@ impl ReaderPool {
         })
         .await
     }
+}
+
+fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Observation>> {
+    let id_bytes: Vec<u8> = row.get(0)?;
+    let session_bytes: Vec<u8> = row.get(1)?;
+    let workspace_bytes: Vec<u8> = row.get(2)?;
+    let project_bytes: Vec<u8> = row.get(3)?;
+    let kind_str: String = row.get(4)?;
+    let title: String = row.get(5)?;
+    let body: String = row.get(6)?;
+    let importance: i64 = row.get(7)?;
+    let created_us: i64 = row.get(8)?;
+    Ok(materialise_observation(
+        id_bytes,
+        session_bytes,
+        workspace_bytes,
+        project_bytes,
+        kind_str,
+        title,
+        body,
+        importance,
+        created_us,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialise_observation(
+    id_bytes: Vec<u8>,
+    session_bytes: Vec<u8>,
+    workspace_bytes: Vec<u8>,
+    project_bytes: Vec<u8>,
+    kind_str: String,
+    title: String,
+    body: String,
+    importance: i64,
+    created_us: i64,
+) -> StoreResult<Observation> {
+    Ok(Observation {
+        id: ObservationId::from_slice(&id_bytes)?,
+        session_id: SessionId::from_slice(&session_bytes)?,
+        workspace_id: WorkspaceId::from_slice(&workspace_bytes)?,
+        project_id: ProjectId::from_slice(&project_bytes)?,
+        kind: kind_str
+            .parse::<ObservationKind>()
+            .map_err(StoreError::from)?,
+        title,
+        body,
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        importance: importance.clamp(1, 10) as u8,
+        created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
+            StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                "bad timestamp: {e}"
+            )))
+        })?,
+    })
 }
 
 fn count(conn: &Connection, sql: &str) -> StoreResult<u64> {

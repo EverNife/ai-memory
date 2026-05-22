@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod init;
+pub mod install_hooks;
 pub mod reset;
 pub mod restore;
 pub mod search;

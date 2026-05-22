@@ -10,7 +10,9 @@
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use ai_memory_core::{NewPage, PageId, ProjectId, WorkspaceId};
+use ai_memory_core::{
+    NewObservation, NewPage, NewSession, ObservationId, PageId, ProjectId, SessionId, WorkspaceId,
+};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
@@ -32,6 +34,19 @@ pub(crate) enum WriteCmd {
     UpsertPage {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
+    },
+    BeginSession {
+        session: NewSession,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    EndSession {
+        session_id: SessionId,
+        summary_page_id: Option<PageId>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    InsertObservation {
+        obs: NewObservation,
+        reply: oneshot::Sender<StoreResult<ObservationId>>,
     },
     Shutdown,
 }
@@ -105,6 +120,47 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Begin a session (idempotent on the supplied id).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn begin_session(&self, session: NewSession) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::BeginSession { session, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Mark a session ended, optionally linking its summary page.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn end_session(
+        &self,
+        session_id: SessionId,
+        summary_page_id: Option<PageId>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndSession {
+            session_id,
+            summary_page_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Append an observation row.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn insert_observation(&self, obs: NewObservation) -> StoreResult<ObservationId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertObservation { obs, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Upsert a page (creating it or superseding the existing latest
     /// version when the body has changed).
     ///
@@ -159,6 +215,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);
+                let _ = reply.send(result);
+            }
+            WriteCmd::BeginSession { session, reply } => {
+                let result = ops::begin_session(&mut conn, &session);
+                let _ = reply.send(result);
+            }
+            WriteCmd::EndSession {
+                session_id,
+                summary_page_id,
+                reply,
+            } => {
+                let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
+                let _ = reply.send(result);
+            }
+            WriteCmd::InsertObservation { obs, reply } => {
+                let result = ops::insert_observation(&mut conn, &obs);
                 let _ = reply.send(result);
             }
         }
