@@ -38,4 +38,13 @@ pub enum StoreError {
     /// Re-export of [`MemoryError`] for cross-crate propagation.
     #[error(transparent)]
     Memory(#[from] MemoryError),
+
+    /// A project rename was rejected because the destination name is already
+    /// in use by another project in the same workspace.
+    #[error("project name '{0}' is already taken in this workspace")]
+    ProjectNameTaken(String),
+
+    /// The supplied project name failed validation (empty, slash, etc.).
+    #[error("invalid project name: {0}")]
+    InvalidProjectName(String),
 }

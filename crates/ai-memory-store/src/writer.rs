@@ -100,6 +100,15 @@ pub(crate) enum WriteCmd {
         label: String,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
+    /// Rename a project's `name` column without moving any files (the wiki
+    /// is flat on disk). Fails with [`crate::error::StoreError::ProjectNameTaken`]
+    /// when `new_name` is already used in the same workspace.
+    RenameProject {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        new_name: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     Shutdown,
 }
 
@@ -340,6 +349,30 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Rename a project within its workspace (column-only; no file moves).
+    ///
+    /// # Errors
+    /// Returns [`crate::error::StoreError::WriterClosed`] if the actor has
+    /// shut down, [`crate::error::StoreError::ProjectNameTaken`] if
+    /// `new_name` is already in use in the same workspace, or
+    /// [`crate::error::StoreError::InvalidProjectName`] for invalid names.
+    pub async fn rename_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        new_name: impl Into<String>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RenameProject {
+            workspace_id,
+            project_id,
+            new_name: new_name.into(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Retro-fit sessions and their observations to per-cwd projects and
     /// graveyard any mash-up pages. The `plan` slice contains
     /// `(session_id, new_project_id)` pairs. Everything runs in one
@@ -523,6 +556,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::purge_project(&mut conn, &workspace_id, &project_id, &label);
                 send_or_warn(reply, result, "purge_project");
+            }
+            WriteCmd::RenameProject {
+                workspace_id,
+                project_id,
+                new_name,
+                reply,
+            } => {
+                let result = ops::rename_project(&mut conn, &workspace_id, &project_id, &new_name);
+                send_or_warn(reply, result, "rename_project");
             }
         }
     }

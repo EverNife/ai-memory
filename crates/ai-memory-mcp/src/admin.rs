@@ -1,15 +1,17 @@
 //! Admin HTTP routes — state-touching operations invoked by the CLI
 //! over plain HTTP (not MCP). Currently exposes:
 //!
-//! - `POST /admin/bootstrap`    — ingest a pre-collected source bundle
+//! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
-//! - `GET  /admin/status`       — lifetime counts + server data-dir info.
-//! - `GET  /admin/search?q=`    — FTS5 hits against the wiki index.
-//! - `POST /admin/reorg`        — retro-fit sessions to per-cwd projects.
-//! - `POST /admin/lint`         — run the M8 lint pass.
-//! - `POST /admin/forget-sweep` — run the M8 retention sweep.
-//! - `POST /admin/embed`        — backfill embeddings for latest pages.
-//! - `POST /admin/commit`       — stage + commit the wiki tree via git.
+//! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
+//! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
+//! - `POST /admin/lint`           — run the M8 lint pass.
+//! - `POST /admin/forget-sweep`   — run the M8 retention sweep.
+//! - `POST /admin/embed`          — backfill embeddings for latest pages.
+//! - `POST /admin/commit`         — stage + commit the wiki tree via git.
+//! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -97,6 +99,7 @@ fn default_max_input_tokens() -> usize {
 /// - `POST /admin/embed`
 /// - `POST /admin/commit`
 /// - `POST /admin/purge-project`
+/// - `POST /admin/rename-project`
 pub fn admin_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/bootstrap", post(handle_bootstrap))
@@ -108,6 +111,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/embed", post(handle_embed))
         .route("/admin/commit", post(handle_commit))
         .route("/admin/purge-project", post(handle_purge_project))
+        .route("/admin/rename-project", post(handle_rename_project))
         .with_state(Arc::new(state))
 }
 
@@ -987,5 +991,133 @@ async fn handle_purge_project(
     (
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+// ---------------------------------------------------------------------
+// rename-project
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/rename-project`.
+#[derive(Deserialize)]
+struct RenameProjectRequest {
+    /// Workspace name (must exist; we don't auto-create on rename).
+    workspace: String,
+    /// Current project name.
+    from: String,
+    /// New project name. Must be non-empty, no slashes.
+    to: String,
+}
+
+/// Wire-format summary returned by `POST /admin/rename-project`.
+#[derive(Debug, Serialize)]
+pub struct RenameProjectSummary {
+    /// Workspace name.
+    pub workspace: String,
+    /// Previous project name.
+    pub from: String,
+    /// New project name.
+    pub to: String,
+    /// Number of `is_latest=1` pages now under the renamed project.
+    /// No files move — this is purely an informational count.
+    pub pages: u64,
+}
+
+async fn handle_rename_project(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RenameProjectRequest>,
+) -> impl IntoResponse {
+    // Step 1: look up workspace; 404 if absent.
+    let ws_id = match state.reader.find_workspace(req.workspace.clone()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("workspace '{}' not found", req.workspace)
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    // Step 2: look up the source project; 404 if absent.
+    let proj_id = match state.reader.find_project(ws_id, req.from.clone()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "project '{}' not found in workspace '{}'",
+                        req.from, req.workspace
+                    )
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    // Step 3: execute the rename. The writer validates the name and
+    // returns ProjectNameTaken / InvalidProjectName on conflicts.
+    if let Err(e) = state
+        .writer
+        .rename_project(ws_id, proj_id, req.to.clone())
+        .await
+    {
+        let status = match &e {
+            StoreError::ProjectNameTaken(_) | StoreError::InvalidProjectName(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return (status, Json(serde_json::json!({ "error": e.to_string() })));
+    }
+
+    // Step 4: count is_latest pages that now belong to the renamed project.
+    // COUNT(*) always produces a row, so no optional() needed. We pass the
+    // 16-byte project id as a plain &[u8] slice to avoid importing rusqlite
+    // (not a direct dependency of this crate).
+    let pid_bytes = *proj_id.as_bytes();
+    let pages = match state
+        .reader
+        .with_conn(move |conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pages WHERE project_id = ?1 AND is_latest = 1",
+                [&pid_bytes[..]],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let summary = RenameProjectSummary {
+        workspace: req.workspace,
+        from: req.from,
+        to: req.to,
+        pages,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}))),
     )
 }

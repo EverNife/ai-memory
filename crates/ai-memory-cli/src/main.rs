@@ -61,5 +61,6 @@ async fn main() -> Result<()> {
         Command::InstallInstructions(args) => commands::install_instructions::run(&config, args),
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
+        Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
     }
 }

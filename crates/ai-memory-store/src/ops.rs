@@ -644,6 +644,54 @@ pub fn reorg_sessions(
     })
 }
 
+/// Rename a project within its workspace.
+///
+/// Only the `name` column is updated — all pages, sessions, observations,
+/// and handoffs remain associated with the same `project_id`. No files
+/// move on disk (the wiki is flat: every page from every project lives
+/// under `wiki/`; only the `project_id` foreign key distinguishes them).
+///
+/// # Errors
+/// - [`StoreError::InvalidProjectName`] when `new_name` is empty,
+///   contains a `/` character, or is all whitespace.
+/// - [`StoreError::ProjectNameTaken`] when a project with `new_name`
+///   already exists in the same workspace.
+/// - [`StoreError::Sqlite`] on any other SQL failure.
+pub fn rename_project(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    new_name: &str,
+) -> StoreResult<()> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err(StoreError::InvalidProjectName(
+            "project name must not be empty or all whitespace".into(),
+        ));
+    }
+    if trimmed.contains('/') {
+        return Err(StoreError::InvalidProjectName(
+            "project name must not contain '/' (it appears in URL paths)".into(),
+        ));
+    }
+
+    let rows = conn.execute(
+        "UPDATE projects SET name = ?1 WHERE id = ?2 AND workspace_id = ?3",
+        params![trimmed, project_id.as_bytes(), workspace_id.as_bytes()],
+    );
+
+    match rows {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(StoreError::ProjectNameTaken(trimmed.to_string()))
+        }
+        Err(e) => Err(StoreError::Sqlite(e)),
+    }
+}
+
 /// Delete a project and all its data inside one transaction.
 ///
 /// Execution order:

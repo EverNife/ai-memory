@@ -89,6 +89,11 @@ pub enum Command {
     /// observations, handoffs, embeddings, on-disk wiki files).
     /// This is irreversible — requires `--confirm`.
     PurgeProject(PurgeProjectArgs),
+    /// Rename a project within its workspace. No files move on disk —
+    /// the wiki is flat and pages are differentiated by project_id only.
+    /// Useful after renaming the project's directory on disk so the hook
+    /// router keeps writing into the same logical project.
+    RenameProject(RenameProjectArgs),
 }
 
 /// Arguments for `reorg`.
@@ -113,6 +118,24 @@ pub struct PurgeProjectArgs {
     /// out — purging is destructive and irreversible.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `rename-project`.
+#[derive(Debug, Args)]
+pub struct RenameProjectArgs {
+    /// Workspace name. Defaults to "default".
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// Current project name. When omitted, auto-derives from the
+    /// basename of the current git repo root (or CWD) — handy when
+    /// running `ai-memory rename-project --to new-name` from a dir
+    /// that was JUST renamed (the basename will be the new name, so
+    /// you'll want to pass --from explicitly in that workflow).
+    #[arg(long)]
+    pub from: Option<String>,
+    /// New project name. Must be non-empty and contain no slashes.
+    #[arg(long)]
+    pub to: String,
 }
 
 /// Arguments for `install-instructions`.
