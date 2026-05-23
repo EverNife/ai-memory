@@ -239,63 +239,9 @@ impl Consolidator {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
-            // When the LLM classifies an update as a rule, ALWAYS
-            // route it to `_rules/<slug>.md` regardless of what
-            // path it suggested — this is the M20 contract that
-            // lets the lint pass find every rule-shaped page in a
-            // single sweep without scanning frontmatter across the
-            // whole wiki.
-            let final_path = if upd.kind == crate::types::PageKind::Rule {
-                let slug = slugify_for_rule(&upd.title);
-                format!("_rules/{slug}.md")
-            } else {
-                upd.path.clone()
-            };
-            let path = PagePath::new(final_path)?;
-            let tier = upd.tier;
-            let mut fm = serde_json::Map::new();
-            fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
-            fm.insert(
-                "tier".into(),
-                serde_json::Value::String(tier_as_str(tier).into()),
-            );
-            // M20: surface the semantic classification into
-            // frontmatter so the lint pass + downstream tooling
-            // can branch on it without re-classifying.
-            fm.insert(
-                "kind".into(),
-                serde_json::Value::String(upd.kind.as_str().into()),
-            );
-            if !upd.tags.is_empty() {
-                fm.insert(
-                    "tags".into(),
-                    serde_json::Value::Array(
-                        upd.tags
-                            .iter()
-                            .map(|t| serde_json::Value::String(t.clone()))
-                            .collect(),
-                    ),
-                );
-            }
-            fm.insert("consolidated".into(), serde_json::Value::Bool(true));
-            requests.push(WritePageRequest {
-                workspace_id: ws,
-                project_id: proj,
-                path: path.clone(),
-                frontmatter: serde_json::Value::Object(fm),
-                body: upd.body_markdown.clone(),
-                tier,
-                pinned: false,
-                title: Some(upd.title.clone()),
-            });
-            outcomes_preview.push(ConsolidationOutcome {
-                path,
-                dry_run,
-                new_title: upd.title.clone(),
-                new_body_markdown: upd.body_markdown.clone(),
-                page_id: None,
-                tags: upd.tags.clone(),
-            });
+            let (req, outcome) = build_update(ws, proj, upd, dry_run)?;
+            requests.push(req);
+            outcomes_preview.push(outcome);
         }
 
         if dry_run {
@@ -322,6 +268,78 @@ impl Consolidator {
             .collect();
         Ok(outcomes)
     }
+}
+
+/// Convert one LLM-produced batch update into the
+/// `(WritePageRequest, ConsolidationOutcome)` pair the consolidator
+/// hands to `Wiki::apply_batch`. Pulled out of
+/// `consolidate_session_multi` so the rule-routing + frontmatter
+/// assembly can be exercised in isolation if needed.
+///
+/// M20 contract: when `upd.kind == Rule`, ALWAYS route to
+/// `_rules/<slug>.md` regardless of the LLM's suggested path. The
+/// lint pass relies on `_rules/` being the single sweep-able
+/// location for rule pages.
+fn build_update(
+    ws: WorkspaceId,
+    proj: ProjectId,
+    upd: &crate::types::ConsolidatedPageUpdate,
+    dry_run: bool,
+) -> ConsolidatorResult<(WritePageRequest, ConsolidationOutcome)> {
+    let final_path = if upd.kind == crate::types::PageKind::Rule {
+        let slug = slugify_for_rule(&upd.title);
+        format!("_rules/{slug}.md")
+    } else {
+        upd.path.clone()
+    };
+    let path = PagePath::new(final_path)?;
+    let tier = upd.tier;
+
+    let mut fm = serde_json::Map::new();
+    fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
+    fm.insert(
+        "tier".into(),
+        serde_json::Value::String(tier_as_str(tier).into()),
+    );
+    // M20: surface the semantic classification into frontmatter so
+    // the lint pass + downstream tooling can branch on it without
+    // re-classifying.
+    fm.insert(
+        "kind".into(),
+        serde_json::Value::String(upd.kind.as_str().into()),
+    );
+    if !upd.tags.is_empty() {
+        fm.insert(
+            "tags".into(),
+            serde_json::Value::Array(
+                upd.tags
+                    .iter()
+                    .map(|t| serde_json::Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    fm.insert("consolidated".into(), serde_json::Value::Bool(true));
+
+    let req = WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: path.clone(),
+        frontmatter: serde_json::Value::Object(fm),
+        body: upd.body_markdown.clone(),
+        tier,
+        pinned: false,
+        title: Some(upd.title.clone()),
+    };
+    let outcome = ConsolidationOutcome {
+        path,
+        dry_run,
+        new_title: upd.title.clone(),
+        new_body_markdown: upd.body_markdown.clone(),
+        page_id: None,
+        tags: upd.tags.clone(),
+    };
+    Ok((req, outcome))
 }
 
 const fn tier_as_str(t: Tier) -> &'static str {

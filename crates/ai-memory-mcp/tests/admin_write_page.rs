@@ -158,6 +158,129 @@ async fn write_page_invalid_tier_returns_422() {
 }
 
 #[tokio::test]
+async fn write_page_two_projects_same_path_no_collision() {
+    // Two projects can hold pages with the same `pages.path` without
+    // colliding on disk — the per-project UUID-keyed layout (CLAUDE.md
+    // §15) guarantees structural isolation. The wiki crate already
+    // exercises this at the `Wiki::write_page` level; this test makes
+    // sure the invariant survives through the full
+    // `POST /admin/write-page` handler path.
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+
+    // Body 1: alpha project.
+    let resp = post_json(
+        state.clone(),
+        "/admin/write-page",
+        json!({
+            "workspace": "default",
+            "project": "alpha",
+            "path": "decisions/0001.md",
+            "body": "Page from project alpha — fingerprint AAAA-alpha.",
+            "tier": "semantic",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let alpha_id = body_json(resp).await["page_id"]
+        .as_str()
+        .expect("alpha page_id")
+        .to_string();
+
+    // Body 2: beta project, SAME page path.
+    let resp = post_json(
+        state.clone(),
+        "/admin/write-page",
+        json!({
+            "workspace": "default",
+            "project": "beta",
+            "path": "decisions/0001.md",
+            "body": "Page from project beta — fingerprint BBBB-beta.",
+            "tier": "semantic",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let beta_id = body_json(resp).await["page_id"]
+        .as_str()
+        .expect("beta page_id")
+        .to_string();
+
+    // Distinct page rows.
+    assert_ne!(
+        alpha_id, beta_id,
+        "the two writes must produce distinct page_ids"
+    );
+
+    // FTS5 search: both fingerprints findable, exactly one hit each.
+    let resp = post_json(state.clone(), "/admin/search?q=AAAA-alpha", json!(null)).await;
+    // /admin/search is a GET, not POST — re-route via the router.
+    drop(resp);
+    let router = admin_router(state.clone());
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/search?q=fingerprint")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hits: serde_json::Value = body_json(resp).await;
+    let hits_arr = hits.as_array().expect("array");
+    assert_eq!(
+        hits_arr.len(),
+        2,
+        "both projects' pages must be searchable: {hits}"
+    );
+    // Same wiki path appears on both hits.
+    assert!(
+        hits_arr
+            .iter()
+            .all(|h| h["path"].as_str() == Some("decisions/0001.md")),
+        "both hits should share the same relative path: {hits}"
+    );
+
+    // Files on disk: both exist at their per-project namespaced paths.
+    // The two project_id UUIDs differ, so two distinct files live on
+    // disk even though pages.path is identical. Recursive walk via
+    // std::fs (no walkdir dep) — collect every `decisions/0001.md`
+    // we find under wiki/.
+    let wiki_dir = tmp.path().join("wiki");
+    let mut on_disk: Vec<std::path::PathBuf> = Vec::new();
+    collect_files_named(&wiki_dir, "decisions/0001.md", &mut on_disk);
+    assert_eq!(
+        on_disk.len(),
+        2,
+        "expected two physical files for the same page path; found: {on_disk:?}"
+    );
+}
+
+/// Recurse into `dir`, collecting every file whose relative path
+/// (from `dir`) ends with `suffix`. Test helper kept inline because
+/// it's only used here and we don't want a walkdir dep.
+fn collect_files_named(dir: &std::path::Path, suffix: &str, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            collect_files_named(&p, suffix, out);
+        } else if ft.is_file() && p.to_string_lossy().replace('\\', "/").ends_with(suffix) {
+            out.push(p);
+        }
+    }
+}
+
+#[tokio::test]
 async fn write_page_with_tags_and_pinned() {
     let tmp = TempDir::new().unwrap();
     let state = make_state(&tmp).await;

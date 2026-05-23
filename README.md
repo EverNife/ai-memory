@@ -29,6 +29,65 @@ Obsidian, backed up with `rsync`. No vector database to babysit, no
 in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the influences and
 priors are at the [bottom](#influences-and-prior-art).
 
+## Key features
+
+- **Zero-friction capture.** Lifecycle hooks fire-and-forget every
+  prompt + tool call + session boundary. You never type `write_note`.
+- **Cross-agent handoffs.** Quit Claude Code mid-task, start Codex
+  in the same directory hours later — the next agent sees a
+  "where you left off" block before its first prompt.
+- **Per-project isolation by construction.** Each project lives at
+  `<wiki_root>/<workspace_id>/<project_id>/…` keyed by stable UUIDs.
+  Same page path can exist in two projects without collision; a
+  rename is one column update; a purge is one `rm -rf`.
+- **Karpathy-style LLM wiki.** Pages are compiled from observations
+  at session-end (or PreCompact), not retrieved over raw logs.
+  Supersession chain + git-versioned markdown means you can
+  time-travel with `git log`.
+- **Built-in `/web` browser.** Read-only HTML UI for the wiki —
+  project list, folder tree, FTS5 search, markdown rendering, dark
+  mode. Mounted on the same axum server as MCP.
+- **Multi-agent + multi-machine ready.** Supported clients: Claude
+  Code, Codex, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
+  Gemini CLI, OpenClaw. Server runs local (loopback) OR on a homelab
+  box (LAN/VPN/cloud) with bearer-token auth.
+- **Thin-client CLI.** `ai-memory bootstrap`, `purge-project`,
+  `rename-project`, `lint`, `embed`, `forget-sweep`, `backup` are
+  all HTTP clients of the running server — never touch SQLite or
+  wiki files directly. Server is the single source of truth.
+- **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
+  rule-based summarisation. Add a provider when you want consolidated
+  pages and lint contradictions.
+
+## Use cases
+
+- **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
+  classic. SessionStart hook in the next agent (any of the
+  supported CLIs) prepends a typed handoff with the open questions,
+  next steps, and a session summary.
+- **"What did we decide about X six weeks ago?"** Type
+  `memory_query X` from the agent (or `ai-memory search X` from a
+  terminal) — FTS5 over the wiki. Pages are LLM-consolidated, so
+  the hit is a coherent decision page, not a raw chat log.
+- **"This new project has months of history before ai-memory."**
+  `cd ~/Projects/<that-project> && ai-memory bootstrap` collects
+  `git log`, README, `docs/`, module headers, project rules and
+  one-shot-summarises them into seed wiki pages. Future sessions
+  build on top.
+- **"Run one ai-memory for the whole household."** Stand the server
+  up on a homelab box at `0.0.0.0:49374` with a bearer token; every
+  laptop/desktop talks to it. Per-cwd routing keeps each project's
+  pages cleanly separated; the `/web` UI is reachable from a
+  browser anywhere on the LAN.
+- **"Audit what landed before sharing with a teammate."** Browse
+  the wiki at `http://<server>:49374/web` — HTTP Basic dialog if
+  auth is on, paste the token as password. Per-project tree view,
+  rendered markdown, supersession chain visible per page.
+- **"Drop an experiment, keep the rest."**
+  `ai-memory purge-project --project experimental --confirm`.
+  Atomic: that project's DB rows cascade away, its wiki subdir gets
+  `rm -rf`'d, every sibling project is untouched by construction.
+
 ## Quick start
 
 You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, Cursor,
