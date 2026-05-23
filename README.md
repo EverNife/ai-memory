@@ -354,6 +354,13 @@ highlighting and metadata (tier, kind, pinned, supersedes chain),
 plus FTS5 search — all read-only, no editing. Light/dark theme
 follows your OS setting via `prefers-color-scheme`.
 
+![Project list homepage with the LLM-optimised banner; four projects (distrobox-gaming, ai-memory, nes-to-sms, .config) shown as cards with page counts + last activity.](docs/web-projects-home.png)
+
+Drill into any project for the folder tree (`concepts/`, `decisions/`,
+`gotchas/`, `sessions/`) and the recent-activity column:
+
+![distrobox-gaming project view: left sidebar shows the folder tree grouped by kind; right column lists recent pages with kind badges and relative timestamps.](docs/web-project-view.png)
+
 ```bash
 ai-memory serve --transport http --bind 127.0.0.1:49374 --enable-web
 # or, if you run via docker compose, add it to the command line in
