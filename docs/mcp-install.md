@@ -38,6 +38,39 @@ events into ai-memory's `/hook` endpoint. The trade-off:
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
 
+## Custom lifecycle bridges
+
+Built-in integrations should use `ai-memory install-hooks` rather than
+calling `/hook` directly. For a third-party bridge that has its own
+lifecycle vocabulary, keep the core `event` query param on one of
+ai-memory's canonical events when possible:
+
+```bash
+curl -X POST \
+  'http://127.0.0.1:49374/hook?event=user-prompt&agent=other' \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"sess-123","cwd":"/repo","prompt":"Fix auth"}'
+```
+
+If the source event has no canonical equivalent, opt in to extension
+metadata instead of asking ai-memory to expand its stored event enum:
+
+```bash
+curl -X POST \
+  'http://127.0.0.1:49374/hook?event=lead.contact&agent=other&extension=fstech' \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"sess-123","title":"Lead contacted","message":"Lead Maria requested a proposal"}'
+```
+
+With `extension=<namespace>`, unknown events are still stored as the
+canonical `other` observation kind, but ai-memory also preserves the
+validated source event. You may pass `source_event=<name>` explicitly;
+otherwise an unknown `event` value becomes the source event. Both tokens
+must be ASCII letters, digits, `.`, `_`, `-`, or `:`; namespaces are
+limited to 64 bytes and source-event names to 128 bytes. Unknown events
+without `extension` intentionally collapse to `other` with no source
+metadata.
+
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
