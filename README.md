@@ -313,6 +313,7 @@ Recommended defaults:
 | Provider | Default | Use when |
 |---|---|---|
 | `anthropic` | `claude-haiku-4-5` | Best default for consolidation quality and rule classification. |
+| `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. |
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
@@ -323,6 +324,15 @@ Recommended defaults:
 the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
 starts, run `ai-memory auth login openai-oauth` with the wrapper so the token
 lands in the same `ai-memory-data` volume as the server.
+
+`anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
+authenticates with an OAuth bearer token instead of an API key. Run
+`claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
+`ANTHROPIC_OAUTH_TOKEN=<token>` (or `CLAUDE_CODE_OAUTH_TOKEN`, which `claude
+setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed.
+**⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
+it may get your account rate-limited or banned. See
+[the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
 
 `copilot` stores a GitHub user token in the same auth file, exchanges it for a
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
