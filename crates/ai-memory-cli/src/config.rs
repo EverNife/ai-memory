@@ -9,7 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
-    EmbedderChoice, EmbedderConfig, LlmError, LlmResult, ProviderChoice, ProviderConfig,
+    AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, ProviderAuth,
+    ProviderChoice, ProviderConfig,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -52,7 +53,7 @@ pub struct Config {
     pub server_url: String,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
-    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`).
+    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `copilot`).
     pub llm_provider: Option<String>,
     /// Optional LLM model override.
     pub llm_model: Option<String>,
@@ -113,6 +114,10 @@ pub struct RuntimeEnv {
     gemini_api_key: Option<SecretString>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
+    copilot_github_token: Option<SecretString>,
+    github_copilot_api_token: Option<SecretString>,
+    copilot_api_url: Option<String>,
+    copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
 }
 
@@ -130,6 +135,12 @@ impl RuntimeEnv {
             gemini_api_key: env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY")),
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
+            copilot_github_token: env_secret("COPILOT_GITHUB_TOKEN")
+                .or_else(|| env_secret("GH_TOKEN"))
+                .or_else(|| env_secret("GITHUB_TOKEN")),
+            github_copilot_api_token: env_secret("GITHUB_COPILOT_API_TOKEN"),
+            copilot_api_url: env_string("COPILOT_API_URL"),
+            copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
         }
     }
@@ -312,10 +323,12 @@ impl Config {
             "openai" => ProviderChoice::OpenAi,
             "gemini" | "google" => ProviderChoice::Gemini,
             "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
+            "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+            "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat"
+                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot"
                 )));
             }
         };
@@ -325,6 +338,8 @@ impl Config {
                 ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
+                ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
+                ProviderChoice::Copilot => "gpt-5.5".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
                         "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
@@ -337,7 +352,7 @@ impl Config {
         Ok(Some(ProviderConfig {
             provider,
             model,
-            api_key: self.provider_api_key(provider),
+            auth: self.provider_auth(provider, None),
             base_url: self.llm_base_url.clone(),
         }))
     }
@@ -418,6 +433,72 @@ impl Config {
             ProviderChoice::OpenAi => self.runtime_env.openai_api_key.clone(),
             ProviderChoice::Gemini => self.runtime_env.gemini_api_key.clone(),
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
+            ProviderChoice::OpenAiOAuth => None,
+            ProviderChoice::Copilot => None,
+        }
+    }
+
+    /// Shared provider auth token file path.
+    #[must_use]
+    pub fn auth_token_path(&self) -> PathBuf {
+        self.data_dir.join("auth.json")
+    }
+
+    /// Shared OpenAI OAuth token file path.
+    #[must_use]
+    pub fn openai_oauth_token_path(&self) -> PathBuf {
+        self.auth_token_path()
+    }
+
+    /// Shared Copilot auth token file path.
+    #[must_use]
+    pub fn copilot_token_path(&self) -> PathBuf {
+        self.auth_token_path()
+    }
+
+    /// GitHub token resolved for Copilot auth login/provider use.
+    #[must_use]
+    pub fn copilot_github_token(&self) -> Option<SecretString> {
+        self.runtime_env.copilot_github_token.clone()
+    }
+
+    /// Copilot OAuth client id override for `auth login copilot`.
+    #[must_use]
+    pub fn copilot_client_id(&self) -> Option<&str> {
+        self.runtime_env.copilot_client_id.as_deref()
+    }
+
+    /// Resolve typed auth material for a provider.
+    ///
+    /// `api_key_override` is used by `llm-test --api-key`; normal server
+    /// startup passes `None` so env/config resolution remains the single path.
+    #[must_use]
+    pub fn provider_auth(
+        &self,
+        provider: ProviderChoice,
+        api_key_override: Option<SecretString>,
+    ) -> ProviderAuth {
+        match provider.auth_requirement() {
+            AuthRequirement::RequiredApiKey { env_var } => {
+                ProviderAuth::required_api_key_from_env(env_var, self.provider_api_key(provider))
+                    .with_cli_api_key_override(api_key_override)
+            }
+            AuthRequirement::OptionalApiKey { env_var } => {
+                ProviderAuth::optional_api_key_from_env(env_var, self.provider_api_key(provider))
+                    .with_cli_api_key_override(api_key_override)
+            }
+            AuthRequirement::OpenAiOAuthToken => {
+                ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
+            }
+            AuthRequirement::CopilotToken => ProviderAuth::copilot(
+                self.copilot_token_path(),
+                self.runtime_env.copilot_github_token.clone(),
+                self.runtime_env.github_copilot_api_token.clone(),
+                self.runtime_env
+                    .copilot_api_url
+                    .clone()
+                    .or_else(|| self.llm_base_url.clone()),
+            ),
         }
     }
 
@@ -594,5 +675,119 @@ mod tests {
 
         let err = cfg.embedder_config().unwrap_err();
         assert!(matches!(err, LlmError::NotConfigured(msg) if msg == "OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn llm_provider_config_uses_typed_provider_auth() {
+        let cfg = Config {
+            llm_provider: Some("openai".into()),
+            runtime_env: RuntimeEnv {
+                openai_api_key: Some(SecretString::from("sk-test-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.provider, ProviderChoice::OpenAi);
+        assert_eq!(provider.model, "gpt-4o-mini");
+        assert_eq!(
+            provider.auth.requirement(),
+            AuthRequirement::RequiredApiKey {
+                env_var: "OPENAI_API_KEY"
+            }
+        );
+        assert_eq!(
+            provider.auth.source(),
+            ai_memory_llm::CredentialSource::Environment {
+                name: "OPENAI_API_KEY"
+            }
+        );
+        assert_eq!(
+            provider.auth.require_api_key().unwrap().expose_secret(),
+            "sk-test-key"
+        );
+    }
+
+    #[test]
+    fn llm_test_api_key_override_wins_over_env_auth() {
+        let cfg = Config {
+            runtime_env: RuntimeEnv {
+                openai_api_key: Some(SecretString::from("env-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let auth = cfg.provider_auth(
+            ProviderChoice::OpenAi,
+            Some(SecretString::from("override-key")),
+        );
+
+        assert_eq!(auth.source(), ai_memory_llm::CredentialSource::CliOverride);
+        assert_eq!(
+            auth.require_api_key().unwrap().expose_secret(),
+            "override-key"
+        );
+    }
+
+    #[test]
+    fn openai_compat_auth_remains_optional() {
+        let cfg = Config::default();
+
+        let auth = cfg.provider_auth(ProviderChoice::OpenAiCompat, None);
+
+        assert_eq!(
+            auth.requirement(),
+            AuthRequirement::OptionalApiKey {
+                env_var: "LLM_API_KEY"
+            }
+        );
+        assert!(auth.optional_api_key().is_none());
+    }
+
+    #[test]
+    fn openai_oauth_provider_uses_data_dir_token_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            llm_provider: Some("openai-oauth".into()),
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::OpenAiOAuth);
+        assert_eq!(provider.model, "gpt-5.5");
+        assert_eq!(
+            provider.auth.requirement(),
+            AuthRequirement::OpenAiOAuthToken
+        );
+        assert_eq!(
+            provider.auth.require_openai_oauth_token_file().unwrap(),
+            tmp.path().join("auth.json")
+        );
+    }
+
+    #[test]
+    fn copilot_provider_uses_data_dir_token_file_and_env_token() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            llm_provider: Some("copilot".into()),
+            runtime_env: RuntimeEnv {
+                copilot_github_token: Some(SecretString::from("ghu-test")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_copilot_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Copilot);
+        assert_eq!(provider.model, "gpt-5.5");
+        assert_eq!(auth.token_file, tmp.path().join("auth.json"));
+        assert_eq!(auth.github_token.unwrap().expose_secret(), "ghu-test");
     }
 }

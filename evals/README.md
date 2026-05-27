@@ -78,6 +78,38 @@ cargo run -p ai-memory-eval -- \
     --candidate-api-key ollama-local
 ```
 
+### ChatGPT/Codex OAuth as one side
+
+Run `ai-memory auth login openai-oauth` first, then point the eval harness at
+the same token file:
+
+```bash
+cargo run -p ai-memory-eval -- \
+    --baseline-provider openai-oauth \
+    --baseline-token-file ~/.local/share/ai-memory/auth.json \
+    --baseline-model gpt-5.5 \
+    --candidate-provider openai-compat \
+    --candidate-base-url http://192.168.0.90:11434/v1 \
+    --candidate-model qwen3:32b \
+    --candidate-api-key ollama-local
+```
+
+### GitHub Copilot as one side
+
+Run `ai-memory auth login copilot` first, then point the eval harness at the
+same auth file:
+
+```bash
+cargo run -p ai-memory-eval -- \
+    --baseline-provider copilot \
+    --baseline-token-file ~/.local/share/ai-memory/auth.json \
+    --baseline-model gpt-5.5 \
+    --candidate-provider openai-compat \
+    --candidate-base-url http://192.168.0.90:11434/v1 \
+    --candidate-model qwen3:32b \
+    --candidate-api-key ollama-local
+```
+
 ### Reading the output
 
 ```

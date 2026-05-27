@@ -95,7 +95,66 @@ pub enum Command {
     /// Remove ai-memory's wiring (hooks, MCP, instructions) from all
     /// detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
+    /// Manage optional upstream LLM provider authentication.
+    Auth(AuthArgs),
 }
+
+/// Arguments for `auth`.
+#[derive(Debug, Args)]
+pub struct AuthArgs {
+    /// Auth action to run.
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+/// Subcommands for `auth`.
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Sign in to an upstream provider.
+    Login(AuthLoginArgs),
+    /// Remove stored provider credentials.
+    Logout(AuthLogoutArgs),
+    /// Show stored provider auth state without printing secrets.
+    Status(AuthStatusArgs),
+}
+
+/// Provider choices for `auth`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum AuthProviderChoice {
+    /// OpenAI ChatGPT/Codex OAuth backend.
+    OpenaiOauth,
+    /// GitHub Copilot Chat backend.
+    Copilot,
+}
+
+/// Arguments for `auth login`.
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Provider to sign in to.
+    #[arg(value_enum)]
+    pub provider: AuthProviderChoice,
+    /// Stop waiting for browser/device authorization after this many seconds.
+    #[arg(long, default_value_t = 600)]
+    pub timeout_secs: u64,
+    /// GitHub token to persist for Copilot instead of running device auth.
+    #[arg(long, hide_env_values = true)]
+    pub github_token: Option<String>,
+    /// OAuth client id override for Copilot device auth.
+    #[arg(long)]
+    pub client_id: Option<String>,
+}
+
+/// Arguments for `auth logout`.
+#[derive(Debug, Args)]
+pub struct AuthLogoutArgs {
+    /// Provider to sign out from.
+    #[arg(value_enum)]
+    pub provider: AuthProviderChoice,
+}
+
+/// Arguments for `auth status`.
+#[derive(Debug, Args)]
+pub struct AuthStatusArgs {}
 
 /// Which concern `uninstall` should touch. Omitted = all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -464,6 +523,10 @@ pub enum LlmProviderChoice {
     Gemini,
     /// OpenAI-compatible local (Ollama, vLLM, LM Studio).
     OpenaiCompat,
+    /// OpenAI ChatGPT/Codex OAuth backend.
+    OpenaiOauth,
+    /// GitHub Copilot Chat backend.
+    Copilot,
 }
 
 /// Arguments for `embed`.
@@ -768,5 +831,54 @@ mod tests {
             };
             assert!(matches!(hook_args.agent, AgentChoice::AntigravityCli));
         }
+    }
+
+    #[test]
+    fn auth_login_openai_oauth_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "auth",
+            "login",
+            "openai-oauth",
+            "--timeout-secs",
+            "30",
+        ])
+        .unwrap();
+
+        let Command::Auth(args) = cli.command else {
+            panic!("expected auth command");
+        };
+        let AuthCommand::Login(login) = args.command else {
+            panic!("expected auth login command");
+        };
+        assert!(matches!(login.provider, AuthProviderChoice::OpenaiOauth));
+        assert_eq!(login.timeout_secs, 30);
+        assert!(login.github_token.is_none());
+        assert!(login.client_id.is_none());
+    }
+
+    #[test]
+    fn auth_login_copilot_parses_token_and_client_override() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "auth",
+            "login",
+            "copilot",
+            "--github-token",
+            "ghu-test",
+            "--client-id",
+            "Iv1.test",
+        ])
+        .unwrap();
+
+        let Command::Auth(args) = cli.command else {
+            panic!("expected auth command");
+        };
+        let AuthCommand::Login(login) = args.command else {
+            panic!("expected auth login command");
+        };
+        assert!(matches!(login.provider, AuthProviderChoice::Copilot));
+        assert_eq!(login.github_token.as_deref(), Some("ghu-test"));
+        assert_eq!(login.client_id.as_deref(), Some("Iv1.test"));
     }
 }

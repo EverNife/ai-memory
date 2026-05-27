@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `memory_write_page` MCP tool for explicit durable annotations, so agents can
   write permanent wiki knowledge without abusing single-use handoffs.
+- `openai-oauth` LLM provider for ChatGPT/Codex accounts, including
+  `ai-memory auth login|logout|status` device-flow commands and token storage
+  in `<data_dir>/auth.json`.
+- `copilot` LLM provider for GitHub Copilot Chat accounts. It stores a GitHub
+  token via `ai-memory auth login copilot`, exchanges it for a short-lived
+  Copilot API token, and sends Copilot Chat requests with `vscode-chat`
+  integration headers.
 
 ### Fixed
 - `install-mcp`, `install-hooks`, and `setup-agent` now honor configured

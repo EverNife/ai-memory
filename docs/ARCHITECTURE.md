@@ -187,7 +187,7 @@ crates/
 ├── ai-memory-wiki/        atomic markdown writes, file watcher, git.
 ├── ai-memory-mcp/         rmcp transport + tool router.
 ├── ai-memory-hooks/       payload schemas, sanitiser, /hook ingress.
-├── ai-memory-llm/         LlmProvider + Embedder traits + 3 providers + 2 embedders.
+├── ai-memory-llm/         provider auth boundary + LlmProvider / Embedder traits.
 ├── ai-memory-consolidate/ Karpathy ingest / lint / sweep pipeline.
 └── ai-memory-cli/         `ai-memory` binary entry point + 17 subcommands.
 ```
@@ -238,7 +238,7 @@ install-mcp          commit               llm-test
 forget-sweep         lint                 embed
 generate-auth-token  setup-agent          bootstrap
 install-instructions reorg                purge-project
-rename-project       uninstall
+rename-project       uninstall            auth
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -278,7 +278,12 @@ that touch the relevant area.
     explicit. (cognee #2228.)
 13. **Zero-LLM default path.** LLM has opt-in via env. The
     system works without any provider configured.
-14. **Tracing subscribers explicitly filter their own module.**
+14. **Provider auth resolves before provider construction.** Native
+    provider clients consume typed `ProviderAuth` material; they never
+    read env vars directly. Token-backed providers receive explicit
+    auth-file paths / env-derived token material through that boundary,
+    then own provider-specific refresh and persistence.
+15. **Tracing subscribers explicitly filter their own module.**
     No feedback loops. (agentmemory #519.)
 
 ## Configuration (`config.toml`)
@@ -300,11 +305,23 @@ hard_delete_after_days = 180
 
 **LLM provider env** (opt-in):
 ```
-AI_MEMORY_LLM_PROVIDER     anthropic | openai | gemini | openai-compat
-AI_MEMORY_LLM_MODEL        e.g. claude-sonnet-4-6, gemini-2.5-flash
+AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini | openai-compat
+AI_MEMORY_LLM_MODEL        e.g. claude-sonnet-4-6, gpt-5.5, gemini-2.5-flash
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
+GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
+COPILOT_API_URL            optional Copilot API base URL override
 ```
+
+`openai-oauth` uses `auth login openai-oauth` and stores the ChatGPT/Codex
+refresh token in `<data_dir>/auth.json`; it is separate from MCP/server bearer
+auth and from OpenAI Platform API keys.
+
+`copilot` uses `auth login copilot` or `COPILOT_GITHUB_TOKEN`, exchanges the
+GitHub token through `/copilot_internal/v2/token`, and calls Copilot Chat with
+the `vscode-chat` integration headers. The raw GitHub token is not sent to the
+Copilot chat endpoint.
 
 **Embedder env** (opt-in):
 ```

@@ -343,7 +343,7 @@ impl OpenAiProvider {
 /// and re-introduce the 400 this function exists to prevent. Callers
 /// that need looser schemas should use the `Compat` dialect (which
 /// skips this normalisation entirely) or a non-strict path.
-fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
+pub(crate) fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             // OpenAI's structured-output subset rejects any sibling

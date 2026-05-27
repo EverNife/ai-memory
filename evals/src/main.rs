@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use ai_memory_consolidate::{ConsolidatedBatch, build_batch_request};
 use ai_memory_core::{Observation, ObservationKind, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::{LlmProvider, ProviderChoice, ProviderConfig};
+use ai_memory_llm::{AuthRequirement, LlmProvider, ProviderAuth, ProviderChoice, ProviderConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -68,7 +68,7 @@ struct Args {
     #[arg(long, default_value = "evals/runs")]
     out: PathBuf,
 
-    /// Baseline provider (`anthropic` / `openai` / `openai-compat`).
+    /// Baseline provider (`anthropic` / `openai` / `openai-compat` / `openai-oauth` / `copilot`).
     #[arg(long)]
     baseline_provider: String,
 
@@ -87,6 +87,10 @@ struct Args {
     /// Env var to read the baseline API key from.
     #[arg(long)]
     baseline_api_key_env: Option<String>,
+
+    /// Baseline OpenAI OAuth token file for `--baseline-provider openai-oauth`.
+    #[arg(long)]
+    baseline_token_file: Option<PathBuf>,
 
     /// Candidate provider.
     #[arg(long)]
@@ -107,6 +111,10 @@ struct Args {
     /// Env var to read the candidate API key from.
     #[arg(long)]
     candidate_api_key_env: Option<String>,
+
+    /// Candidate OpenAI OAuth token file for `--candidate-provider openai-oauth`.
+    #[arg(long)]
+    candidate_token_file: Option<PathBuf>,
 }
 
 /// JSON shape of an eval fixture file. We only care about
@@ -264,13 +272,14 @@ async fn main() -> Result<()> {
 
 /// Resolve `ProviderConfig` for one side from CLI args + env.
 fn resolve_provider(side: &str, args: &Args) -> Result<ResolvedConfig> {
-    let (provider_str, base_url, model, api_key_inline, api_key_env) = match side {
+    let (provider_str, base_url, model, api_key_inline, api_key_env, token_file) = match side {
         "baseline" => (
             args.baseline_provider.as_str(),
             args.baseline_base_url.clone(),
             args.baseline_model.clone(),
             args.baseline_api_key.clone(),
             args.baseline_api_key_env.clone(),
+            args.baseline_token_file.clone(),
         ),
         "candidate" => (
             args.candidate_provider.as_str(),
@@ -278,6 +287,7 @@ fn resolve_provider(side: &str, args: &Args) -> Result<ResolvedConfig> {
             args.candidate_model.clone(),
             args.candidate_api_key.clone(),
             args.candidate_api_key_env.clone(),
+            args.candidate_token_file.clone(),
         ),
         _ => bail!("unknown side {side}"),
     };
@@ -286,7 +296,13 @@ fn resolve_provider(side: &str, args: &Args) -> Result<ResolvedConfig> {
         "anthropic" => ProviderChoice::Anthropic,
         "openai" => ProviderChoice::OpenAi,
         "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
-        other => bail!("{side}: provider {other} not one of anthropic|openai|openai-compat"),
+        "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
+        other => {
+            bail!(
+                "{side}: provider {other} not one of anthropic|openai|openai-compat|openai-oauth|copilot"
+            )
+        }
     };
 
     let api_key = match (api_key_inline, api_key_env) {
@@ -298,21 +314,44 @@ fn resolve_provider(side: &str, args: &Args) -> Result<ResolvedConfig> {
         _ => None,
     };
 
+    let auth = match provider.auth_requirement() {
+        AuthRequirement::RequiredApiKey { env_var } => {
+            ProviderAuth::required_api_key_from_env(env_var, api_key)
+        }
+        AuthRequirement::OptionalApiKey { env_var } => {
+            ProviderAuth::optional_api_key_from_env(env_var, api_key)
+        }
+        AuthRequirement::OpenAiOAuthToken => {
+            ProviderAuth::openai_oauth_token_file(token_file.ok_or_else(|| {
+                anyhow::anyhow!("{side}: --{side}-token-file is required for openai-oauth")
+            })?)
+        }
+        AuthRequirement::CopilotToken => ProviderAuth::copilot(
+            token_file.ok_or_else(|| {
+                anyhow::anyhow!("{side}: --{side}-token-file is required for copilot")
+            })?,
+            None,
+            None,
+            base_url.clone(),
+        ),
+    };
+
     Ok(ResolvedConfig {
         provider,
         provider_str: provider_str.to_string(),
         model,
         base_url,
-        api_key,
+        auth,
     })
 }
 
+#[derive(Clone)]
 struct ResolvedConfig {
     provider: ProviderChoice,
     provider_str: String,
     model: String,
     base_url: Option<String>,
-    api_key: Option<SecretString>,
+    auth: ProviderAuth,
 }
 
 impl ResolvedConfig {
@@ -321,28 +360,12 @@ impl ResolvedConfig {
     }
 }
 
-impl Clone for ResolvedConfig {
-    fn clone(&self) -> Self {
-        Self {
-            provider: self.provider,
-            provider_str: self.provider_str.clone(),
-            model: self.model.clone(),
-            base_url: self.base_url.clone(),
-            // SecretString is not Clone — re-wrap if needed.
-            api_key: self.api_key.as_ref().map(|s| {
-                use secrecy::ExposeSecret;
-                SecretString::from(s.expose_secret().to_string())
-            }),
-        }
-    }
-}
-
 impl From<ResolvedConfig> for ProviderConfig {
     fn from(r: ResolvedConfig) -> Self {
         Self {
             provider: r.provider,
             model: r.model,
-            api_key: r.api_key,
+            auth: r.auth,
             base_url: r.base_url,
         }
     }

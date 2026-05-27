@@ -31,7 +31,7 @@
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
-| LLM providers | Supported | Anthropic, OpenAI, Gemini, and OpenAI-compatible endpoints. |
+| LLM providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, and OpenAI-compatible endpoints. |
 | Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
 
 ## What it is
@@ -286,8 +286,20 @@ Recommended defaults:
 |---|---|---|
 | `anthropic` | `claude-haiku-4-5` | Best default for consolidation quality and rule classification. |
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
+| `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
+| `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-2.5-flash` | Google-hosted option with a generous free tier. |
 | `openai-compat` | no default | OpenRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+
+`openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
+the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
+starts, run `ai-memory auth login openai-oauth` with the wrapper so the token
+lands in the same `ai-memory-data` volume as the server.
+
+`copilot` stores a GitHub user token in the same auth file, exchanges it for a
+short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
+uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
+also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when

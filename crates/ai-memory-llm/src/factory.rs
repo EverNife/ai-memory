@@ -8,15 +8,18 @@ use std::sync::Arc;
 use secrecy::SecretString;
 
 use crate::AnthropicProvider;
+use crate::CopilotProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
+use crate::OpenAiOAuthProvider;
 use crate::OpenAiProvider;
+use crate::auth::{AuthRequirement, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
 use crate::provider::LlmProvider;
 
-/// Four providers ship in v1.
+/// LLM providers available to ai-memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderChoice {
     /// Anthropic Messages API.
@@ -27,17 +30,44 @@ pub enum ProviderChoice {
     Gemini,
     /// OpenAI-compatible (Ollama / vLLM / LM Studio).
     OpenAiCompat,
+    /// OpenAI ChatGPT/Codex OAuth backend.
+    OpenAiOAuth,
+    /// GitHub Copilot Chat backend.
+    Copilot,
 }
 
-/// All settings needed to construct one of the three providers.
+impl ProviderChoice {
+    /// Auth requirement for this provider.
+    #[must_use]
+    pub const fn auth_requirement(self) -> AuthRequirement {
+        match self {
+            Self::Anthropic => AuthRequirement::RequiredApiKey {
+                env_var: "ANTHROPIC_API_KEY",
+            },
+            Self::OpenAi => AuthRequirement::RequiredApiKey {
+                env_var: "OPENAI_API_KEY",
+            },
+            Self::Gemini => AuthRequirement::RequiredApiKey {
+                env_var: "GEMINI_API_KEY",
+            },
+            Self::OpenAiCompat => AuthRequirement::OptionalApiKey {
+                env_var: "LLM_API_KEY",
+            },
+            Self::OpenAiOAuth => AuthRequirement::OpenAiOAuthToken,
+            Self::Copilot => AuthRequirement::CopilotToken,
+        }
+    }
+}
+
+/// All settings needed to construct one LLM provider instance.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     /// Provider selection.
     pub provider: ProviderChoice,
     /// Model id (`claude-opus-4-7`, `gpt-4o-mini`, `llama3.1:8b`, …).
     pub model: String,
-    /// API key. Required for Anthropic + OpenAI; optional for compat.
-    pub api_key: Option<SecretString>,
+    /// Resolved provider authentication material.
+    pub auth: ProviderAuth,
     /// Base URL override (required for OpenAI-compat).
     pub base_url: Option<String>,
 }
@@ -138,21 +168,15 @@ pub fn default_embedding_dim(provider: EmbedderChoice, model: &str) -> u32 {
 pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>> {
     match config.provider {
         ProviderChoice::Anthropic => {
-            let key = config
-                .api_key
-                .ok_or_else(|| LlmError::NotConfigured("ANTHROPIC_API_KEY".into()))?;
+            let key = config.auth.require_api_key()?;
             Ok(Arc::new(AnthropicProvider::new(key, config.model)?))
         }
         ProviderChoice::OpenAi => {
-            let key = config
-                .api_key
-                .ok_or_else(|| LlmError::NotConfigured("OPENAI_API_KEY".into()))?;
+            let key = config.auth.require_api_key()?;
             Ok(Arc::new(OpenAiProvider::new(key, config.model)?))
         }
         ProviderChoice::Gemini => {
-            let key = config
-                .api_key
-                .ok_or_else(|| LlmError::NotConfigured("GEMINI_API_KEY".into()))?;
+            let key = config.auth.require_api_key()?;
             Ok(Arc::new(GeminiProvider::new(key, config.model)?))
         }
         ProviderChoice::OpenAiCompat => {
@@ -161,9 +185,74 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
             Ok(Arc::new(OpenAiCompatProvider::new(
                 base,
-                config.api_key,
+                config.auth.optional_api_key(),
                 config.model,
             )?))
         }
+        ProviderChoice::OpenAiOAuth => {
+            let path = config.auth.require_openai_oauth_token_file()?.to_path_buf();
+            Ok(Arc::new(OpenAiOAuthProvider::new(path, config.model)?))
+        }
+        ProviderChoice::Copilot => {
+            let auth = config.auth.require_copilot_auth()?;
+            Ok(Arc::new(CopilotProvider::new(auth, config.model)?))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_choices_declare_current_auth_requirements() {
+        assert_eq!(
+            ProviderChoice::Anthropic.auth_requirement(),
+            AuthRequirement::RequiredApiKey {
+                env_var: "ANTHROPIC_API_KEY"
+            }
+        );
+        assert_eq!(
+            ProviderChoice::OpenAi.auth_requirement(),
+            AuthRequirement::RequiredApiKey {
+                env_var: "OPENAI_API_KEY"
+            }
+        );
+        assert_eq!(
+            ProviderChoice::Gemini.auth_requirement(),
+            AuthRequirement::RequiredApiKey {
+                env_var: "GEMINI_API_KEY"
+            }
+        );
+        assert_eq!(
+            ProviderChoice::OpenAiCompat.auth_requirement(),
+            AuthRequirement::OptionalApiKey {
+                env_var: "LLM_API_KEY"
+            }
+        );
+        assert_eq!(
+            ProviderChoice::OpenAiOAuth.auth_requirement(),
+            AuthRequirement::OpenAiOAuthToken
+        );
+        assert_eq!(
+            ProviderChoice::Copilot.auth_requirement(),
+            AuthRequirement::CopilotToken
+        );
+    }
+
+    #[test]
+    fn missing_required_provider_auth_preserves_error_shape() {
+        let cfg = ProviderConfig {
+            provider: ProviderChoice::OpenAi,
+            model: "gpt-4o-mini".into(),
+            auth: ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", None),
+            base_url: None,
+        };
+
+        let err = match build_provider(cfg) {
+            Ok(_) => panic!("provider should fail without OPENAI_API_KEY"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, LlmError::NotConfigured(msg) if msg == "OPENAI_API_KEY"));
     }
 }

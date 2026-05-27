@@ -18,6 +18,7 @@
 #   AI_MEMORY_SERVER_URL    server URL for thin-client commands; if unset,
 #                           the wrapper reaches the host loopback server
 #                           started by the README quick start.
+#   COPILOT_GITHUB_TOKEN    GitHub token for AI_MEMORY_LLM_PROVIDER=copilot
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
 set -euo pipefail
@@ -212,6 +213,7 @@ for var in \
   AI_MEMORY_LLM_PROVIDER \
   AI_MEMORY_LLM_MODEL \
   AI_MEMORY_LLM_BASE_URL \
+  AI_MEMORY_COPILOT_CLIENT_ID \
   AI_MEMORY_EMBEDDING_PROVIDER \
   AI_MEMORY_EMBEDDING_MODEL \
   AI_MEMORY_EMBEDDING_BASE_URL \
@@ -221,6 +223,9 @@ for var in \
   AI_MEMORY_HOOKS_HOST_ROOT \
   ANTHROPIC_API_KEY \
   OPENAI_API_KEY \
+  COPILOT_GITHUB_TOKEN \
+  GITHUB_COPILOT_API_TOKEN \
+  COPILOT_API_URL \
   VOYAGE_API_KEY \
   LLM_API_KEY \
   RUST_LOG

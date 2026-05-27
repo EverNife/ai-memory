@@ -151,15 +151,18 @@ dependencies = [
  "ai-memory-core",
  "anyhow",
  "async-trait",
+ "base64",
  "regex",
  "reqwest",
  "schemars",
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

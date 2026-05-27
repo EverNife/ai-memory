@@ -35,6 +35,10 @@ pub enum LlmError {
     #[error("provider not configured: {0}")]
     NotConfigured(String),
 
+    /// Provider authentication failed or expired.
+    #[error("auth: {0}")]
+    Auth(String),
+
     /// JSON schema for structured output could not be derived.
     #[error("schema: {0}")]
     Schema(String),

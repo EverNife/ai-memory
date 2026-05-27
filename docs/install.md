@@ -349,6 +349,8 @@ ai-memory works in three intensity tiers:
 |---|---|---|---|
 | **Zero-LLM** (default) | FTS5 search, rule-based session summaries, auto-handoffs from prompt + tool-call history | (none) | $0 |
 | **+ LLM consolidation** | LLM rewrites session pages as coherent narratives; PreCompact checkpoints; LLM-driven contradiction lint | `AI_MEMORY_LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | ~$0.01–0.05 / session |
+| **+ ChatGPT/Codex OAuth** | Same LLM features using a ChatGPT Pro/Plus login instead of an OpenAI Platform key | `AI_MEMORY_LLM_PROVIDER=openai-oauth` + `ai-memory auth login openai-oauth` | Uses your ChatGPT subscription |
+| **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ Hybrid retrieval** | RRF over FTS5 + vector cosine similarity. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` | ~$0.0001 / page on backfill |
 
 ### Recommended models (chosen as defaults)
@@ -359,6 +361,8 @@ If you set only the provider, ai-memory picks a sensible default:
 |---|---|---|
 | `AI_MEMORY_LLM_PROVIDER=anthropic` | `claude-haiku-4-5` | **Recommended default.** Best balance of speed, restraint, and classification quality. Not a reasoning model. Consistently classifies durable project rules as `kind: rule`. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
+| `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. |
+| `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-2.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 2.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Reuses `LLM_API_KEY` or `OPENAI_API_KEY` with the OpenAI-compatible embedding client. |
@@ -369,6 +373,67 @@ If you set only the provider, ai-memory picks a sensible default:
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
 > internal reasoning and hang or emit empty responses with the strict-JSON
 > consolidation prompt. Turn reasoning off if you must use one.
+
+### OpenAI OAuth / Codex
+
+`openai-oauth` is for ChatGPT Pro/Plus/Codex accounts. It does **not** use
+`OPENAI_API_KEY` and it does **not** call `api.openai.com`; requests go to the
+ChatGPT/Codex Responses backend with a refreshable OAuth token.
+
+For the Docker quick start wrapper, this writes into the same named volume the
+server mounts at `/data`:
+
+```bash
+ai-memory auth login openai-oauth
+docker run -d --name ai-memory \
+    -p 127.0.0.1:49374:49374 \
+    -v ai-memory-data:/data \
+    -e AI_MEMORY_LLM_PROVIDER=openai-oauth \
+    akitaonrails/ai-memory:latest
+```
+
+For a remote Docker host, run the login on that host against the same container
+or data volume:
+
+```bash
+docker exec -it ai-memory ai-memory auth login openai-oauth
+```
+
+Use `ai-memory auth status` to check whether a token is present and
+`ai-memory auth logout openai-oauth` to remove it.
+
+### GitHub Copilot
+
+`copilot` uses a GitHub user token, then exchanges it for a short-lived Copilot
+API token through `https://api.github.com/copilot_internal/v2/token`. The raw
+GitHub token is never sent to `api.githubcopilot.com`.
+
+For the Docker quick start wrapper:
+
+```bash
+ai-memory auth login copilot
+docker run -d --name ai-memory \
+    -p 127.0.0.1:49374:49374 \
+    -v ai-memory-data:/data \
+    -e AI_MEMORY_LLM_PROVIDER=copilot \
+    akitaonrails/ai-memory:latest
+```
+
+For a remote Docker host, run the login against the same data volume:
+
+```bash
+docker exec -it ai-memory ai-memory auth login copilot
+```
+
+Non-interactive deploys can set `COPILOT_GITHUB_TOKEN` instead. ai-memory also
+accepts `GH_TOKEN` and `GITHUB_TOKEN` when running natively; prefer the explicit
+`COPILOT_GITHUB_TOKEN` in Docker so you do not pass a broad token by accident.
+Advanced users with a pre-minted Copilot API token can set
+`GITHUB_COPILOT_API_TOKEN` and optionally `COPILOT_API_URL`.
+
+`auth login copilot` defaults to GitHub Copilot's public device-flow client id.
+Pass `--client-id` or set `AI_MEMORY_COPILOT_CLIENT_ID` if you operate your own
+OAuth app.
 
 ### Self-hosted LLMs (Ollama / vLLM / LM Studio / OpenRouter)
 
@@ -406,8 +471,10 @@ docker exec ai-memory ai-memory status --json
 docker exec ai-memory ai-memory search "karpathy"
 docker exec ai-memory ai-memory backup --to /data/snapshot.tar.gz
 
-# B) One-shot, no running container needed (pure-stdout: generate-
-#    auth-token, install-mcp, install-hooks, setup-agent, llm-test).
+# B) One-shot, no running container needed for pure-stdout helpers
+#    (generate-auth-token, install-mcp, install-hooks, setup-agent, llm-test).
+#    Auth login is stateful: use docker exec against the running container or
+#    the wrapper so it writes into the same data volume as the server.
 docker run --rm akitaonrails/ai-memory:latest generate-auth-token
 docker run --rm akitaonrails/ai-memory:latest install-mcp --client cursor
 docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
@@ -424,6 +491,8 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `commit -m "…"` | `docker exec` | Stage + commit the wiki tree |
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
+| `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
+| `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
 | `install-hooks --agent` | `docker run --rm` | Hook-config snippet for an existing hooks dir |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |

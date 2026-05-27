@@ -97,6 +97,29 @@ sources to the running server. It requires an LLM provider on the
 server. See [Installation cookbook - bootstrap mid-project](install.md#bootstrap-mid-project)
 for flags, token budgets, and source priority.
 
+If you use the ChatGPT/Codex OAuth provider, sign in once before starting the
+server with `AI_MEMORY_LLM_PROVIDER=openai-oauth`:
+
+```bash
+ai-memory auth login openai-oauth
+ai-memory auth status
+```
+
+The login command stores only provider credentials in `<data_dir>/auth.json`.
+It is separate from `AI_MEMORY_AUTH_TOKEN`, which protects MCP, hooks, and the
+web UI.
+
+For GitHub Copilot, use the matching provider login before starting the server
+with `AI_MEMORY_LLM_PROVIDER=copilot`:
+
+```bash
+ai-memory auth login copilot
+ai-memory auth status
+```
+
+Copilot auth stores a GitHub user token, then the provider exchanges it for a
+short-lived Copilot API token before each LLM call.
+
 ## Browse the wiki in a browser
 
 Start the server with `--enable-web` and open

@@ -1,0 +1,671 @@
+//! OpenAI ChatGPT/Codex OAuth provider.
+//!
+//! This is intentionally not a thin wrapper around `api.openai.com`: ChatGPT
+//! OAuth access tokens are Codex/ChatGPT credentials, not Platform API keys.
+//! Requests go to the Codex Responses backend and include the account id when
+//! the token exposes one.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use base64::Engine as _;
+use secrecy::{ExposeSecret as _, SecretString};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tracing::{debug, info};
+
+use crate::auth_file::{load_entry, now_ms, save_entry};
+use crate::error::{LlmError, LlmResult};
+use crate::openai::enforce_strict_object_schemas;
+use crate::provider::LlmProvider;
+use crate::text::truncate_with_ellipsis;
+use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+
+/// OpenAI OAuth issuer used by Codex/OpenCode.
+pub const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
+
+/// OpenAI OAuth authorization endpoint.
+pub const OPENAI_OAUTH_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
+
+/// OpenAI OAuth token endpoint.
+pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+/// ChatGPT/Codex Responses backend.
+pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+/// Public Codex/OpenCode OAuth client id.
+pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// Scopes used by Codex/OpenCode for ChatGPT sign-in.
+pub const OAUTH_SCOPES: &str = "openid profile email offline_access";
+
+const REFRESH_MARGIN_MS: u64 = 60_000;
+
+/// Stored OpenAI OAuth token.
+#[derive(Clone)]
+pub struct OpenAiOAuthToken {
+    /// Access token sent as the bearer token.
+    pub access: SecretString,
+    /// Refresh token used to mint a new access token.
+    pub refresh: SecretString,
+    /// Expiry in milliseconds since Unix epoch.
+    pub expires_at_ms: u64,
+    /// ChatGPT account/workspace id, when present in the token claims.
+    pub account_id: Option<String>,
+}
+
+impl std::fmt::Debug for OpenAiOAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiOAuthToken")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
+}
+
+impl OpenAiOAuthToken {
+    /// Build a token from an OAuth token response.
+    #[must_use]
+    pub fn from_token_response(
+        access: impl Into<String>,
+        refresh: impl Into<String>,
+        expires_in_secs: u64,
+        id_token: Option<&str>,
+        previous_account_id: Option<String>,
+    ) -> Self {
+        let access = access.into();
+        let account_id = id_token
+            .and_then(extract_account_id_from_jwt)
+            .or_else(|| extract_account_id_from_jwt(&access))
+            .or(previous_account_id);
+        Self {
+            access: SecretString::from(access),
+            refresh: SecretString::from(refresh.into()),
+            expires_at_ms: now_ms().saturating_add(expires_in_secs.saturating_mul(1000)),
+            account_id,
+        }
+    }
+
+    /// True when the access token is expired or within the refresh margin.
+    #[must_use]
+    pub fn needs_refresh(&self) -> bool {
+        now_ms().saturating_add(REFRESH_MARGIN_MS) >= self.expires_at_ms
+    }
+
+    /// Load the OpenAI OAuth token from a shared token file.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::Auth`] when the file exists but cannot be read or
+    /// parsed.
+    pub fn load(path: &Path) -> LlmResult<Option<Self>> {
+        let Some(entry) = load_entry::<OAuthEntry>(path, "openai")? else {
+            return Ok(None);
+        };
+        if entry.kind != "oauth" {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            access: SecretString::from(entry.access),
+            refresh: SecretString::from(entry.refresh),
+            expires_at_ms: entry.expires,
+            account_id: entry.account_id,
+        }))
+    }
+
+    /// Save the token into the shared token file, preserving unknown keys.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::Auth`] when the file cannot be written.
+    pub fn save(&self, path: &Path) -> LlmResult<()> {
+        let entry = OAuthEntry {
+            kind: "oauth".into(),
+            access: self.access.expose_secret().to_string(),
+            refresh: self.refresh.expose_secret().to_string(),
+            expires: self.expires_at_ms,
+            account_id: self.account_id.clone(),
+        };
+        save_entry(path, "openai", Some(entry))
+    }
+
+    /// Remove the OpenAI entry from the shared token file.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::Auth`] when the file cannot be updated.
+    pub fn remove(path: &Path) -> LlmResult<()> {
+        save_entry::<OAuthEntry>(path, "openai", None)
+    }
+}
+
+/// OAuth token response returned by `auth.openai.com`.
+#[derive(Debug, Deserialize)]
+pub struct OpenAiOAuthTokenResponse {
+    /// Access token.
+    pub access_token: String,
+    /// Refresh token. Refresh responses may omit it, meaning keep old refresh.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Expires-in seconds. Codex/OpenCode default to one hour when omitted.
+    #[serde(default)]
+    pub expires_in: Option<u64>,
+    /// Optional ID token carrying ChatGPT account claims.
+    #[serde(default)]
+    pub id_token: Option<String>,
+}
+
+/// OpenAI OAuth provider backed by the ChatGPT/Codex Responses endpoint.
+pub struct OpenAiOAuthProvider {
+    client: reqwest::Client,
+    model: String,
+    token_path: PathBuf,
+    token: Mutex<OpenAiOAuthToken>,
+}
+
+impl OpenAiOAuthProvider {
+    /// Build a provider from an OAuth token file.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] when no token is present.
+    pub fn new(token_path: PathBuf, model: impl Into<String>) -> LlmResult<Self> {
+        let token = OpenAiOAuthToken::load(&token_path)?.ok_or_else(|| {
+            LlmError::NotConfigured(format!(
+                "no openai-oauth token found at {}; run `ai-memory auth login openai-oauth`",
+                token_path.display()
+            ))
+        })?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(LlmError::from)?;
+        Ok(Self {
+            client,
+            model: model.into(),
+            token_path,
+            token: Mutex::new(token),
+        })
+    }
+
+    async fn current_token(&self) -> LlmResult<OpenAiOAuthToken> {
+        let mut guard = self.token.lock().await;
+        if guard.needs_refresh() {
+            info!("openai-oauth token expired or near-expiry, refreshing");
+            let refreshed = refresh_access_token(&self.client, &guard).await?;
+            refreshed.save(&self.token_path)?;
+            *guard = refreshed;
+        }
+        Ok(guard.clone())
+    }
+
+    async fn post(&self, body: &CodexResponsesRequest<'_>) -> LlmResult<CodexResponsesResponse> {
+        let token = self.current_token().await?;
+        debug!(
+            url = CODEX_RESPONSES_URL,
+            "POST openai-oauth codex responses"
+        );
+        let mut request = self
+            .client
+            .post(CODEX_RESPONSES_URL)
+            .bearer_auth(token.access.expose_secret())
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .header("openai-beta", "responses=experimental")
+            .header("originator", "codex_cli_rs")
+            .header("session_id", uuid::Uuid::new_v4().to_string())
+            .json(body);
+        if let Some(account_id) = token.account_id.as_deref() {
+            request = request.header("chatgpt-account-id", account_id);
+        }
+        let resp = request.send().await.map_err(LlmError::from)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body: truncate_with_ellipsis(&body, 1024),
+            });
+        }
+        resp.json::<CodexResponsesResponse>()
+            .await
+            .map_err(LlmError::from)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiOAuthProvider {
+    fn name(&self) -> &'static str {
+        "openai-oauth"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
+        let response = self
+            .post(&build_request(&self.model, &request, None))
+            .await?;
+        Ok(into_chat_response(response))
+    }
+
+    async fn complete_structured_raw(
+        &self,
+        request: ChatRequest,
+        mut schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        enforce_strict_object_schemas(&mut schema);
+        let response_format = CodexText {
+            format: CodexTextFormat::JsonSchema {
+                name: "Result".into(),
+                schema,
+                strict: true,
+            },
+        };
+        let response = self
+            .post(&build_request(&self.model, &request, Some(response_format)))
+            .await?;
+        let text = extract_output_text(&response).unwrap_or_default();
+        serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
+    }
+}
+
+async fn refresh_access_token(
+    client: &reqwest::Client,
+    current: &OpenAiOAuthToken,
+) -> LlmResult<OpenAiOAuthToken> {
+    let resp = client
+        .post(OPENAI_OAUTH_TOKEN_URL)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", current.refresh.expose_secret()),
+            ("client_id", CODEX_CLIENT_ID),
+        ])
+        .send()
+        .await
+        .map_err(LlmError::from)?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(LlmError::Auth(format!(
+            "openai-oauth refresh failed ({status}): {body}. Run `ai-memory auth login openai-oauth` again."
+        )));
+    }
+    let token_response = resp
+        .json::<OpenAiOAuthTokenResponse>()
+        .await
+        .map_err(LlmError::from)?;
+    Ok(OpenAiOAuthToken::from_token_response(
+        token_response.access_token,
+        token_response
+            .refresh_token
+            .unwrap_or_else(|| current.refresh.expose_secret().to_string()),
+        token_response.expires_in.unwrap_or(3600),
+        token_response.id_token.as_deref(),
+        current.account_id.clone(),
+    ))
+}
+
+fn build_request<'a>(
+    model: &'a str,
+    request: &'a ChatRequest,
+    text: Option<CodexText>,
+) -> CodexResponsesRequest<'a> {
+    let input = request
+        .messages
+        .iter()
+        .map(|msg| CodexInputMessage {
+            role: match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            },
+            content: vec![CodexInputContent {
+                kind: "input_text",
+                text: &msg.content,
+            }],
+        })
+        .collect();
+    CodexResponsesRequest {
+        model,
+        instructions: request.system.as_deref(),
+        input,
+        max_output_tokens: Some(request.max_tokens),
+        temperature: if model_uses_default_temperature(model) {
+            None
+        } else {
+            request.temperature
+        },
+        store: false,
+        stream: false,
+        text,
+    }
+}
+
+fn model_uses_default_temperature(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("gpt-5") || m.starts_with('o')
+}
+
+#[derive(Debug, Serialize)]
+struct CodexResponsesRequest<'a> {
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    input: Vec<CodexInputMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    store: bool,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<CodexText>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexInputMessage<'a> {
+    role: &'a str,
+    content: Vec<CodexInputContent<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexInputContent<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    text: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexText {
+    format: CodexTextFormat,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexTextFormat {
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        strict: bool,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexResponsesResponse {
+    #[serde(default)]
+    output_text: Option<String>,
+    #[serde(default)]
+    output: Vec<CodexOutputItem>,
+    #[serde(default)]
+    usage: Option<CodexUsage>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexOutputItem {
+    #[serde(default)]
+    content: Vec<CodexOutputContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexOutputContent {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
+    let model = response
+        .model
+        .clone()
+        .unwrap_or_else(|| "openai-oauth".into());
+    ChatResponse {
+        text: extract_output_text(&response).unwrap_or_default(),
+        usage: response.usage.map(|u| Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        }),
+        model,
+    }
+}
+
+fn extract_output_text(response: &CodexResponsesResponse) -> Option<String> {
+    if let Some(text) = response
+        .output_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    response
+        .output
+        .iter()
+        .flat_map(|item| item.content.iter())
+        .filter_map(|content| content.text.as_deref())
+        .find(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OAuthEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    access: String,
+    refresh: String,
+    expires: u64,
+    #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+}
+
+fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    value
+        .get("chatgpt_account_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            value
+                .get("https://api.openai.com/auth")
+                .and_then(|v| v.get("chatgpt_account_id"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            value
+                .get("organizations")
+                .and_then(|v| v.as_array())
+                .and_then(|v| v.first())
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::ExposeSecret as _;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn token_file_preserves_unknown_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth_token.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "other": { "type": "oauth", "access": "x" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let token = OpenAiOAuthToken {
+            access: SecretString::from("access"),
+            refresh: SecretString::from("refresh"),
+            expires_at_ms: 1234,
+            account_id: Some("acct".into()),
+        };
+        token.save(&path).unwrap();
+        let value =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(value.get("other").is_some());
+        assert_eq!(value["openai"]["access"], "access");
+        assert_eq!(value["openai"]["accountId"], "acct");
+    }
+
+    #[test]
+    fn token_file_round_trips_openai_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth_token.json");
+        let token = OpenAiOAuthToken {
+            access: SecretString::from("access"),
+            refresh: SecretString::from("refresh"),
+            expires_at_ms: 1234,
+            account_id: None,
+        };
+        token.save(&path).unwrap();
+        let loaded = OpenAiOAuthToken::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.access.expose_secret(), "access");
+        assert_eq!(loaded.refresh.expose_secret(), "refresh");
+        assert_eq!(loaded.expires_at_ms, 1234);
+    }
+
+    #[test]
+    fn token_file_ignores_non_oauth_openai_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth_token.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "openai": { "type": "api", "key": "sk-test" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(OpenAiOAuthToken::load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_deletes_only_openai_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth_token.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "openai": { "type": "oauth", "access": "a", "refresh": "r", "expires": 1 },
+                "other": { "type": "oauth", "access": "x" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        OpenAiOAuthToken::remove(&path).unwrap();
+        let value =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(value.get("openai").is_none());
+        assert!(value.get("other").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth_token.json");
+        let token = OpenAiOAuthToken {
+            access: SecretString::from("access"),
+            refresh: SecretString::from("refresh"),
+            expires_at_ms: 1234,
+            account_id: None,
+        };
+        token.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn jwt_account_id_extraction_uses_supported_fallbacks() {
+        fn jwt(payload: serde_json::Value) -> String {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).unwrap());
+            format!("x.{payload}.y")
+        }
+        assert_eq!(
+            extract_account_id_from_jwt(&jwt(json!({ "chatgpt_account_id": "top" }))),
+            Some("top".into())
+        );
+        assert_eq!(
+            extract_account_id_from_jwt(&jwt(json!({
+                "https://api.openai.com/auth": { "chatgpt_account_id": "nested" }
+            }))),
+            Some("nested".into())
+        );
+        assert_eq!(
+            extract_account_id_from_jwt(&jwt(json!({ "organizations": [{ "id": "org" }] }))),
+            Some("org".into())
+        );
+    }
+
+    #[test]
+    fn codex_request_moves_system_to_instructions_and_omits_gpt5_temperature() {
+        let request = ChatRequest {
+            system: Some("sys".into()),
+            messages: vec![crate::types::ChatMessage {
+                role: Role::User,
+                content: "hello".into(),
+            }],
+            temperature: Some(0.2),
+            max_tokens: 123,
+        };
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, None)).unwrap();
+        assert_eq!(value["instructions"], "sys");
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
+        assert!(value.get("temperature").is_none());
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], false);
+    }
+
+    #[test]
+    fn structured_request_uses_responses_json_schema_format() {
+        let request = ChatRequest::user_prompt("json please");
+        let text = CodexText {
+            format: CodexTextFormat::JsonSchema {
+                name: "Result".into(),
+                schema: json!({ "type": "object", "properties": {} }),
+                strict: true,
+            },
+        };
+        let value = serde_json::to_value(build_request("gpt-5.5", &request, Some(text))).unwrap();
+        assert_eq!(value["text"]["format"]["type"], "json_schema");
+        assert_eq!(value["text"]["format"]["name"], "Result");
+        assert_eq!(value["text"]["format"]["strict"], true);
+    }
+
+    #[test]
+    fn response_text_prefers_output_text_then_output_items() {
+        let direct: CodexResponsesResponse = serde_json::from_value(json!({
+            "output_text": "direct",
+            "output": [{ "content": [{ "text": "nested" }] }]
+        }))
+        .unwrap();
+        assert_eq!(extract_output_text(&direct).as_deref(), Some("direct"));
+
+        let nested: CodexResponsesResponse = serde_json::from_value(json!({
+            "output": [{ "content": [{ "text": "nested" }] }]
+        }))
+        .unwrap();
+        assert_eq!(extract_output_text(&nested).as_deref(), Some("nested"));
+    }
+}

@@ -14,15 +14,14 @@ use crate::config::Config;
 /// lacks the required keys, or the HTTP call fails.
 pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
     let provider = ProviderChoice::from(args.provider);
-    let api_key = args
+    let api_key_override = args
         .api_key
         .filter(|s| !s.is_empty())
-        .map(secrecy::SecretString::from)
-        .or_else(|| config.provider_api_key(provider));
+        .map(secrecy::SecretString::from);
     let provider_config = ProviderConfig {
         provider,
         model: args.model,
-        api_key,
+        auth: config.provider_auth(provider, api_key_override),
         base_url: args.base_url.or_else(|| config.llm_test_base_url()),
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
@@ -54,6 +53,8 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Openai => Self::OpenAi,
             LlmProviderChoice::Gemini => Self::Gemini,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
+            LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
+            LlmProviderChoice::Copilot => Self::Copilot,
         }
     }
 }
