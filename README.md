@@ -327,6 +327,11 @@ Useful entry points:
   `overview` bundles the open handoff + briefing + memory-health for a workspace
   or project in one call (the data a project overview screen needs).
 
+  **Full integration guide:** see [`docs/frontend-api.md`](docs/frontend-api.md)
+  for auth setup, response schemas, error model, limits/pagination,
+  custom-UI hosting, a worked `fetch`/`curl` example, and the canonical
+  source-of-truth files. Read that first if you're building a frontend.
+
   To serve your own static frontend instead of the built-in UI, point
   `--web-ui-dir` at the frontend's build output (same-origin with
   `/api/v1`, `/mcp`, `/admin/*`, so the existing auth applies):
