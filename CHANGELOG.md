@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-30
+
 ### Added
 - **Multi-user attribution (v0.8 Phase 1, rolling out across milestones
   P1.1–P1.8).** ai-memory's data model stays single-tenant — every
@@ -592,7 +594,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.8.0
 [0.7.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.7.1
 [0.7.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.7.0
 [0.6.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.6.1
