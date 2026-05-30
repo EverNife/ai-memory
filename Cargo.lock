@@ -199,6 +199,8 @@ version = "0.7.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
+ "base64",
+ "getrandom 0.3.4",
  "jiff",
  "parking_lot",
  "refinery",
@@ -206,6 +208,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

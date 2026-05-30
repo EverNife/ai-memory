@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ai_memory_core::{
     AgentKind, Handoff, HandoffId, HandoffState, Observation, ObservationId, ObservationKind,
-    PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    PageId, PagePath, ProjectId, SessionId, User, UserId, WorkspaceId,
 };
 use parking_lot::Mutex;
 use rusqlite::types::Value;
@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
+use crate::users::TOKEN_HASH_LEN;
 
 /// One hit returned by [`ReaderPool::search_pages`].
 #[derive(Debug, Clone, Serialize)]
@@ -2773,6 +2774,55 @@ impl ReaderPool {
             Ok(names)
         })
         .await
+    }
+
+    // ── user lookups ────────────────────────────────────────────────
+
+    /// Hot path for the auth middleware: hash the incoming bearer token,
+    /// look up the matching row, and return the user iff their token is
+    /// active (`token_expired_at IS NULL`).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error. Returns `Ok(None)` when no row
+    /// matches the hash (either no such user, or the token was expired).
+    pub async fn find_active_user_by_token_hash(
+        &self,
+        token_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<Option<User>> {
+        self.with_conn(move |conn| crate::users::find_active_user_by_token_hash(conn, &token_hash))
+            .await
+    }
+
+    /// Look up a user by exact-match username. Used by admin endpoints
+    /// that accept username on the wire (`expire`, `revive`,
+    /// `rotate-token`).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_user_by_username(&self, username: String) -> StoreResult<Option<User>> {
+        self.with_conn(move |conn| crate::users::find_user_by_username(conn, &username))
+            .await
+    }
+
+    /// Look up a user by id. **Returns even users whose token is expired**
+    /// — this is the attribution-display path (a page authored by alice
+    /// must still render "alice" after her token has been expired).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_user_by_id(&self, id: UserId) -> StoreResult<Option<User>> {
+        self.with_conn(move |conn| crate::users::find_user_by_id(conn, id))
+            .await
+    }
+
+    /// All registered users, ordered by `created_at` ascending. Includes
+    /// users whose token is expired (the CLI surfaces the active/expired
+    /// flag from `token_expired_at`).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_users(&self) -> StoreResult<Vec<User>> {
+        self.with_conn(crate::users::list_users).await
     }
 }
 

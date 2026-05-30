@@ -18,6 +18,7 @@ mod fts_query;
 mod migrations;
 mod ops;
 mod reader;
+pub mod users;
 mod writer;
 
 pub use fts_query::prepare_fts5_query;
@@ -31,6 +32,7 @@ pub use reader::{
     PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, RelatedPage, StatusCounts,
     StoredEmbedding, WorkspaceSummary, f32_vec_to_bytes,
 };
+pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use writer::WriterHandle;
 
 /// Filename used inside the data dir's `db/` subdirectory.
