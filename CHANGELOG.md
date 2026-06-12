@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-06-12
 ### Added
 - Native hook drain and handoff timings can now be raised with
   `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES`,
@@ -937,7 +939,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.0
 [0.16.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.16.0
 [0.15.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.15.0
 [0.14.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.14.0
