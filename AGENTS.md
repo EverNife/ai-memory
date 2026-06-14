@@ -98,6 +98,10 @@ without disturbing the rest of the file.
 - Treat typed boundaries as load-bearing: IDs, `PagePath`, `AgentKind`,
   sanitization, workspace/project resolution, and provider dialects should be
   parsed or normalized once and reused.
+- Preserve workspace/project isolation at shared helper boundaries. Read,
+  search, embed, retention, and destructive paths must use no-create lookups
+  and fail closed on partial or missing scope; only explicit write/create
+  paths may create workspaces or projects.
 - Prefer explicit fallbacks over `unwrap`, `expect`, or `unreachable!` in
   runtime paths. Panics are acceptable in tests only.
 - Do not use `unsafe` for performance work in this project unless profiling

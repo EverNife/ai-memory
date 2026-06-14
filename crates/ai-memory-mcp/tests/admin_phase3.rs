@@ -203,6 +203,95 @@ async fn reorg_live_moves_sessions() {
 }
 
 #[tokio::test]
+async fn reorg_live_graveyards_only_default_workspace_pages() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_sessions_for_reorg(&store).await;
+
+    let default_ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let default_proj = store
+        .writer
+        .get_or_create_project(default_ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: default_ws,
+            project_id: default_proj,
+            path: PagePath::new("notes/default-latest.md").unwrap(),
+            title: "Default latest".into(),
+            body: "default workspace page should be graveyarded".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+        })
+        .await
+        .unwrap();
+
+    let sibling_ws = store
+        .writer
+        .get_or_create_workspace("sibling")
+        .await
+        .unwrap();
+    let sibling_proj = store
+        .writer
+        .get_or_create_project(sibling_ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: sibling_ws,
+            project_id: sibling_proj,
+            path: PagePath::new("notes/sibling-latest.md").unwrap(),
+            title: "Sibling latest".into(),
+            body: "sibling workspace page must remain latest".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+        })
+        .await
+        .unwrap();
+
+    let resp = post(state, "/admin/reorg", json!({ "dry_run": false })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["summary"]["pages_graveyarded"].as_u64().unwrap(), 1);
+
+    let default_hits = store
+        .reader
+        .recent_pages_for_project(default_ws, default_proj, 10)
+        .await
+        .unwrap();
+    assert!(
+        default_hits.is_empty(),
+        "default workspace latest page should be graveyarded"
+    );
+
+    let sibling_hits = store
+        .reader
+        .recent_pages_for_project(sibling_ws, sibling_proj, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        sibling_hits.len(),
+        1,
+        "sibling workspace latest page must survive default reorg"
+    );
+    assert_eq!(sibling_hits[0].path.as_str(), "notes/sibling-latest.md");
+}
+
+#[tokio::test]
 async fn reorg_empty_store_returns_empty_plan() {
     let tmp = TempDir::new().unwrap();
     let (state, _store) = make_state(&tmp).await;
@@ -279,7 +368,17 @@ async fn lint_dry_run_returns_lint_report_shape() {
 #[tokio::test]
 async fn forget_sweep_dry_run_returns_sweep_report_shape() {
     let tmp = TempDir::new().unwrap();
-    let (state, _store) = make_state(&tmp).await;
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
 
     let resp = post(
         state,
@@ -340,6 +439,35 @@ async fn embed_without_embedder_returns_503() {
     assert!(
         body["error"].as_str().unwrap_or("").contains("embedder"),
         "error must mention embedder: {body}"
+    );
+}
+
+#[tokio::test]
+async fn embed_missing_project_scope_does_not_create_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_state(&tmp).await;
+    state.embedder = Some(Arc::new(SyntheticEmbedder::new(64)));
+
+    let resp = post(
+        state,
+        "/admin/embed",
+        json!({
+            "workspace": "missing",
+            "project": "ghost",
+            "reembed": false,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let missing_ws = store
+        .reader
+        .find_workspace("missing".to_string())
+        .await
+        .unwrap();
+    assert!(
+        missing_ws.is_none(),
+        "embed must not create a missing workspace"
     );
 }
 

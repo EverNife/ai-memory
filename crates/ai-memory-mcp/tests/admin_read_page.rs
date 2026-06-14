@@ -237,3 +237,26 @@ async fn read_page_404_when_truly_absent() {
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn read_page_missing_scope_does_not_create_workspace_or_project() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    let resp = get(
+        state,
+        "/admin/read-page?workspace=missing&project=ghost&path=notes%2Fnope.md",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let missing_ws = store
+        .reader
+        .find_workspace("missing".to_string())
+        .await
+        .unwrap();
+    assert!(
+        missing_ws.is_none(),
+        "read-page must not create a missing workspace"
+    );
+}

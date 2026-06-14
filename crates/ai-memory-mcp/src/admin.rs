@@ -380,10 +380,10 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
 struct SearchQuery {
     /// FTS5 query expression.
     q: String,
-    /// Workspace name to search within. When omitted with `project`, admin search is global.
+    /// Workspace name to search within. Must be provided together with `project`.
     #[serde(default)]
     workspace: Option<String>,
-    /// Project name to search within. When omitted with `workspace`, admin search is global.
+    /// Project name to search within. Must be provided together with `workspace`.
     #[serde(default)]
     project: Option<String>,
     /// Max number of hits to return. Capped at 100 server-side.
@@ -400,17 +400,29 @@ async fn handle_search(
     Query(query): Query<SearchQuery>,
 ) -> impl IntoResponse {
     let limit = query.limit.clamp(1, 100);
-    let search_result = match (query.workspace.as_deref(), query.project.as_deref()) {
-        (Some(workspace), Some(project)) => match resolve_ws_proj(&state, workspace, project).await
-        {
-            Ok((ws, proj)) => {
-                state
-                    .reader
-                    .search_pages_for_project(ws, proj, query.q, limit)
-                    .await
+    let search_result = match (
+        trimmed_opt(query.workspace.as_deref()),
+        trimmed_opt(query.project.as_deref()),
+    ) {
+        (Some(workspace), Some(project)) => {
+            match lookup_ws_proj_no_create(&state, workspace, project).await {
+                Ok((ws, proj)) => {
+                    state
+                        .reader
+                        .search_pages_for_project(ws, proj, query.q, limit)
+                        .await
+                }
+                Err(e) => return e,
             }
-            Err(e) => return e,
-        },
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "workspace and project must be provided together"
+                })),
+            );
+        }
         _ => state.reader.search_pages(query.q, limit).await,
     };
     match search_result {
@@ -466,15 +478,9 @@ async fn handle_read_page(
     State(state): State<Arc<AdminState>>,
     Query(query): Query<ReadPageQuery>,
 ) -> impl IntoResponse {
-    let (ws, proj) = match resolve_ws_proj(&state, &query.workspace, &query.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
-
-    // Resolve the page path: direct `path` takes precedence over `q`.
-    let page_path = if let Some(raw) = query.path {
+    let direct_path = if let Some(raw) = query.path {
         match ai_memory_core::PagePath::new(raw) {
-            Ok(p) => p,
+            Ok(p) => Some(p),
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -482,6 +488,25 @@ async fn handle_read_page(
                 );
             }
         }
+    } else {
+        None
+    };
+    if direct_path.is_none() && query.q.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "provide `path` or `q`" })),
+        );
+    }
+
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    // Resolve the page path: direct `path` takes precedence over `q`.
+    let page_path = if let Some(path) = direct_path {
+        path
     } else if let Some(q) = query.q {
         let hits = match state
             .reader
@@ -583,9 +608,13 @@ fn is_missing_wiki_file(err: &WikiError) -> bool {
     matches!(err, WikiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
+fn trimmed_opt(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Resolve workspace + project IDs, creating them if absent. Returns
 /// either the IDs or a ready-to-return error response.
-async fn resolve_ws_proj(
+async fn create_ws_proj(
     state: &AdminState,
     workspace: &str,
     project: &str,
@@ -605,8 +634,8 @@ async fn resolve_ws_proj(
 
 /// Look up workspace + project by name **without** auto-creating them.
 /// Returns `(WorkspaceId, ProjectId)` on success, or a ready-to-return
-/// 404/500 error response. Used by destructive handlers (purge, rename)
-/// where auto-creation would silently succeed on a typo.
+/// 404/500 error response. Used by read, maintenance, and destructive
+/// handlers where auto-creation would silently succeed on a typo.
 async fn lookup_ws_proj_no_create(
     state: &AdminState,
     workspace: &str,
@@ -670,7 +699,7 @@ async fn handle_bootstrap(
             })),
         ));
     }
-    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
 
     // Serialise live bootstrap runs. Two parallel `process_sources`
     // calls would race the wiki's `commit_all` (libgit2 ops on the
@@ -850,16 +879,17 @@ pub struct ReorgReport {
 /// `(session_id, project_id, cwd)` triples ordered by `started_at`.
 async fn list_sessions_with_cwd(
     reader: &ai_memory_store::ReaderPool,
+    workspace_id: WorkspaceId,
 ) -> Result<Vec<(SessionId, ProjectId, String)>, StoreError> {
     reader
         .with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, project_id, cwd \
                      FROM sessions \
-                     WHERE cwd IS NOT NULL AND cwd != '' \
+                     WHERE workspace_id = ?1 AND cwd IS NOT NULL AND cwd != '' \
                      ORDER BY started_at",
             )?;
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map([workspace_id.as_bytes().as_slice()], |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let proj_bytes: Vec<u8> = row.get(1)?;
                 let cwd: String = row.get(2)?;
@@ -945,7 +975,7 @@ async fn handle_reorg(
         }
     };
 
-    let sessions = match list_sessions_with_cwd(&state.reader).await {
+    let sessions = match list_sessions_with_cwd(&state.reader, ws).await {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -1000,7 +1030,7 @@ async fn handle_reorg(
         );
     }
 
-    let summary = match state.writer.reorg_sessions(writer_plan).await {
+    let summary = match state.writer.reorg_sessions(ws, writer_plan).await {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -1033,10 +1063,10 @@ async fn handle_reorg(
 /// JSON request body for `POST /admin/lint`.
 #[derive(Deserialize)]
 struct LintRequest {
-    /// Workspace name (auto-created if absent).
+    /// Workspace name (must already exist).
     #[serde(default = "default_workspace")]
     workspace: String,
-    /// Project name (auto-created if absent).
+    /// Project name (must already exist).
     #[serde(default = "default_project")]
     project: String,
     /// Don't write the lint report page.
@@ -1061,7 +1091,7 @@ async fn handle_lint(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<LintRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
     run_lint(
         &state.reader,
@@ -1089,10 +1119,10 @@ async fn handle_lint(
 /// JSON request body for `POST /admin/forget-sweep`.
 #[derive(Deserialize)]
 struct ForgetSweepRequest {
-    /// Workspace name (auto-created if absent).
+    /// Workspace name (must already exist).
     #[serde(default = "default_workspace")]
     workspace: String,
-    /// Project name (auto-created if absent).
+    /// Project name (must already exist).
     #[serde(default = "default_project")]
     project: String,
     /// Report what would be evicted without actually mutating.
@@ -1104,7 +1134,7 @@ async fn handle_forget_sweep(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<ForgetSweepRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
     run_sweep(
         &state.reader,
@@ -1131,10 +1161,10 @@ async fn handle_forget_sweep(
 /// JSON request body for `POST /admin/embed`.
 #[derive(Deserialize)]
 struct EmbedRequest {
-    /// Workspace name (auto-created if absent).
+    /// Workspace name (must already exist).
     #[serde(default = "default_workspace")]
     workspace: String,
-    /// Project name (auto-created if absent). Ignored when
+    /// Project name (must already exist). Ignored when
     /// [`Self::all_projects`] is true.
     #[serde(default = "default_project")]
     project: String,
@@ -1343,7 +1373,7 @@ async fn handle_embed(
             }
         }
     } else {
-        let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+        let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
         if req.reembed && !req.dry_run {
             let purged = state
                 .writer
@@ -2246,7 +2276,7 @@ async fn handle_move_project(
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let (dst_ws, dst_proj) = match resolve_ws_proj(&state, &req.to_workspace, &req.project).await {
+    let (dst_ws, dst_proj) = match create_ws_proj(&state, &req.to_workspace, &req.project).await {
         Ok(ids) => ids,
         Err(e) => return e,
     };
@@ -2776,7 +2806,7 @@ async fn handle_write_page(
         )
     })?;
 
-    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+    let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
 
     let mut fm = serde_json::Map::new();
     if let Some(title) = &req.title {

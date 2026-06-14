@@ -94,6 +94,8 @@ pub(crate) enum WriteCmd {
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
     /// mash-up pages. Executed in one transaction for atomicity.
     Reorg {
+        /// Workspace whose legacy mash-up pages and sessions are being reorged.
+        workspace_id: WorkspaceId,
         /// Each entry is `(session_id, new_project_id)`.
         plan: Vec<(SessionId, ProjectId)>,
         reply: oneshot::Sender<StoreResult<ReorgSummary>>,
@@ -636,10 +638,16 @@ impl WriterHandle {
     /// propagates the SQL error from the reorg transaction.
     pub async fn reorg_sessions(
         &self,
+        workspace_id: WorkspaceId,
         plan: Vec<(SessionId, ProjectId)>,
     ) -> StoreResult<ReorgSummary> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::Reorg { plan, reply: tx }).await?;
+        self.send(WriteCmd::Reorg {
+            workspace_id,
+            plan,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -918,8 +926,12 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::cancel_handoff(&mut conn, &handoff_id);
                 send_or_warn(reply, result, "cancel_handoff");
             }
-            WriteCmd::Reorg { plan, reply } => {
-                let result = ops::reorg_sessions(&mut conn, &plan);
+            WriteCmd::Reorg {
+                workspace_id,
+                plan,
+                reply,
+            } => {
+                let result = ops::reorg_sessions(&mut conn, &workspace_id, &plan);
                 send_or_warn(reply, result, "reorg_sessions");
             }
             WriteCmd::BumpAccess { page_ids, reply } => {

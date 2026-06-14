@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.0.4] - 2026-06-14
 ### Added
 - `install-hooks --agent grok` (plus `setup-agent` / `uninstall` coverage) for
   the xAI **Grok Build CLI**. Grok's `~/.grok/hooks/ai-memory.json` shares Claude
@@ -35,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only, so a cross-workspace handoff was routed by the per-actor active-project
   fallback and could be written to — or read from — the wrong project.
   `memory_handoff_cancel` already carried `workspace`.
+- Workspace/project resolution now fails closed across the MCP and admin
+  surfaces. Explicit MCP project misses no longer fall back to the active/default
+  project, write-style MCP calls reject `workspace` without `project`, admin
+  read/search/embed/lint/sweep paths use no-create lookups, and `/admin/reorg`
+  only moves sessions and graveyards latest pages inside the target workspace.
 
 ## [1.0.3] - 2026-06-13
 ### Added
@@ -999,7 +1006,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.4
 [1.0.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.3
 [1.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.2
 [1.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.1

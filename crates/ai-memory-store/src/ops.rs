@@ -929,6 +929,7 @@ fn audit(
 /// fresh consolidation can regenerate clean per-project pages.
 pub fn reorg_sessions(
     conn: &mut Connection,
+    workspace_id: &WorkspaceId,
     plan: &[(SessionId, ProjectId)],
 ) -> StoreResult<ReorgSummary> {
     if plan.is_empty() {
@@ -939,23 +940,34 @@ pub fn reorg_sessions(
     let mut observations_updated = 0usize;
     for (session_id, new_project_id) in plan {
         let rows = tx.execute(
-            "UPDATE sessions SET project_id = ?1 WHERE id = ?2 AND project_id != ?1",
-            params![new_project_id.as_bytes(), session_id.as_bytes()],
+            "UPDATE sessions
+             SET project_id = ?1
+             WHERE id = ?2 AND workspace_id = ?3 AND project_id != ?1",
+            params![
+                new_project_id.as_bytes(),
+                session_id.as_bytes(),
+                workspace_id.as_bytes()
+            ],
         )?;
         sessions_moved += rows;
         // Update observations whose session_id matches, keeping project_id
         // in sync with the session row we just moved.
         let obs_rows = tx.execute(
-            "UPDATE observations SET project_id = ?1 WHERE session_id = ?2",
-            params![new_project_id.as_bytes(), session_id.as_bytes()],
+            "UPDATE observations SET project_id = ?1 WHERE session_id = ?2 AND workspace_id = ?3",
+            params![
+                new_project_id.as_bytes(),
+                session_id.as_bytes(),
+                workspace_id.as_bytes()
+            ],
         )?;
         observations_updated += obs_rows;
     }
-    // Graveyard all current latest pages — they mixed observations from
-    // multiple projects and must be regenerated per-project by the next
-    // consolidation pass.
-    let pages_graveyarded: usize =
-        tx.execute("UPDATE pages SET is_latest = 0 WHERE is_latest = 1", [])?;
+    // Graveyard only this workspace's latest pages; sibling workspaces may
+    // have already-consolidated pages that must remain current.
+    let pages_graveyarded: usize = tx.execute(
+        "UPDATE pages SET is_latest = 0 WHERE workspace_id = ?1 AND is_latest = 1",
+        params![workspace_id.as_bytes()],
+    )?;
     tx.commit()?;
     Ok(ReorgSummary {
         sessions_moved,

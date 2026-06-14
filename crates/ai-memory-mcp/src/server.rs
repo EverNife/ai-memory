@@ -104,9 +104,8 @@ the conversation calls for them:\n\
 - `memory_delete_page` — when the user explicitly asks to delete or \
   remove a specific page (by exact path). Idempotent; fires the \
   admission chain so mirrors/backups stay consistent. Pass `workspace` \
-  + `project` together only when the page lives in a sibling workspace \
-  (otherwise a project name that exists in multiple workspaces can \
-  silently route the delete to the wrong slot).\n\
+  + `project` together only when the page lives in a sibling \
+  workspace/project; missing explicit scopes fail closed instead of falling back.\n\
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
@@ -455,10 +454,8 @@ struct DeletePageArgs {
     /// Workspace to delete from together with `project`. Omit to use the
     /// current/default workspace resolution chain. Provide both to delete a
     /// page that lives in a *different* workspace (e.g. a sibling project on
-    /// a shared server). Without this, a delete targeting a project that
-    /// exists in MULTIPLE workspaces can silently land in the wrong slot —
-    /// fixed by routing scope resolution through the same path the read
-    /// tools use (`effective_ids_for_read_args`).
+    /// a shared server). Missing explicit scopes fail closed instead of
+    /// falling back to the active/default project.
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -616,13 +613,13 @@ impl AiMemoryServer {
         &self,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
-    ) -> (WorkspaceId, ProjectId) {
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
         let active = self.active_project.get_for(actor);
         if let Some(name) = explicit_project.map(str::trim).filter(|s| !s.is_empty()) {
             if let Some((active_ws, _)) = active
                 && let Ok(Some(pid)) = self.reader.find_project(active_ws, name.to_string()).await
             {
-                return (active_ws, pid);
+                return Ok((active_ws, pid));
             }
             if active.map(|(ws, _)| ws) != Some(self.workspace_id)
                 && let Ok(Some(pid)) = self
@@ -630,10 +627,14 @@ impl AiMemoryServer {
                     .find_project(self.workspace_id, name.to_string())
                     .await
             {
-                return (self.workspace_id, pid);
+                return Ok((self.workspace_id, pid));
             }
+            return Err(McpError::internal_error(
+                format!("project '{name}' not found in the active or default workspace"),
+                None,
+            ));
         }
-        active.unwrap_or((self.workspace_id, self.project_id))
+        Ok(active.unwrap_or((self.workspace_id, self.project_id)))
     }
 
     async fn effective_ids_for_read_args_with_actor(
@@ -651,7 +652,7 @@ impl AiMemoryServer {
                 "workspace and project must be provided together",
                 None,
             )),
-            (None, project) => Ok(self.effective_ids_with_actor(project, actor).await),
+            (None, project) => self.effective_ids_with_actor(project, actor).await,
         }
     }
 
@@ -719,8 +720,14 @@ impl AiMemoryServer {
         actor: &ai_memory_core::ActorKey,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
         let Some(project) = trimmed_opt(explicit_project) else {
+            if trimmed_opt(explicit_workspace).is_some() {
+                return Err(McpError::internal_error(
+                    "workspace and project must be provided together",
+                    None,
+                ));
+            }
             // No explicit project → current project (hook-published active, or
-            // the baked default). Explicit workspace alone has nothing to scope.
+            // the baked default).
             return Ok(self
                 .active_project
                 .get_for(actor)
@@ -1372,8 +1379,8 @@ impl AiMemoryServer {
         before the file is removed so backups/mirrors stay consistent. \
         Idempotent — deleting a page that is already gone is a no-op. \
         Pass `workspace` + `project` together when the page lives in a \
-        sibling workspace (otherwise a project name that exists in multiple \
-        workspaces can silently route the delete to the wrong slot). \
+        sibling workspace; missing explicit scopes fail closed instead of \
+        falling back to the active/default project. \
         Returns `{ path, deleted }`.")]
     async fn memory_delete_page(
         &self,
@@ -2243,7 +2250,8 @@ mod tests {
         assert_eq!(
             server
                 .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
-                .await,
+                .await
+                .unwrap(),
             (ws, baked)
         );
 
@@ -2263,7 +2271,8 @@ mod tests {
         assert_eq!(
             server
                 .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
-                .await,
+                .await
+                .unwrap(),
             (ws, other)
         );
 
@@ -2271,22 +2280,21 @@ mod tests {
         assert_eq!(
             server
                 .effective_ids_with_actor(Some("scratch"), &ai_memory_core::ActorKey::default())
-                .await,
+                .await
+                .unwrap(),
             (ws, baked),
             "explicit project arg should override the active pointer"
         );
 
-        // An explicit but unknown project name falls through to the
-        // active pointer rather than erroring or returning a bogus id.
-        assert_eq!(
-            server
-                .effective_ids_with_actor(
-                    Some("does-not-exist"),
-                    &ai_memory_core::ActorKey::default()
-                )
-                .await,
-            (ws, other),
-            "unknown explicit project falls through to the active pointer"
+        // An explicit but unknown project name fails closed instead of
+        // silently falling through to the active pointer.
+        let err = server
+            .effective_ids_with_actor(Some("does-not-exist"), &ai_memory_core::ActorKey::default())
+            .await
+            .expect_err("unknown explicit project must not fall back");
+        assert!(
+            err.to_string().contains("does-not-exist"),
+            "error should name the missing explicit project: {err}"
         );
     }
 
@@ -2363,6 +2371,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_target_ids_rejects_workspace_without_project() {
+        let (_tmp, _store, server, _baked_ws, _baked_proj) = setup_server().await;
+
+        let err = server
+            .write_target_ids(Some("default"), None)
+            .await
+            .expect_err("workspace-only writes must fail closed");
+        assert!(
+            err.to_string()
+                .contains("workspace and project must be provided together"),
+            "error should explain the required scope pair: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn project_only_write_round_trips_with_project_only_read_in_active_workspace() {
         let (tmp, store, server, baked_ws, _baked_proj) = setup_server().await;
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
@@ -2432,7 +2455,8 @@ mod tests {
         assert_eq!(
             server
                 .effective_ids_with_actor(Some("sibling"), &ai_memory_core::ActorKey::default())
-                .await,
+                .await
+                .unwrap(),
             (active_ws, sibling_proj),
             "project-only read resolution should use the active workspace"
         );
@@ -3145,6 +3169,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_write_page_rejects_workspace_without_project() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        let err = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/invalid-scope.md".into(),
+                    body: "# Invalid Scope".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: Some("default".into()),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("workspace-only memory_write_page must fail");
+        assert!(
+            err.to_string()
+                .contains("workspace and project must be provided together"),
+            "error should explain the required scope pair: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_unknown_explicit_project_does_not_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/default.md".into(),
+                    body: "# Default\n\nThis page must not be read through a typo.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/default.md".into()),
+                    project: Some("typo".into()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("unknown explicit project must not fall back to scratch");
+        assert!(
+            err.to_string().contains("typo"),
+            "error should name the missing explicit project: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_delete_page_removes_the_page() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -3238,6 +3356,71 @@ mod tests {
             !recent_text.contains("notes/temp.md"),
             "deleted page must not linger in the index; got {recent_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_delete_page_unknown_explicit_project_does_not_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/keep.md".into(),
+                    body: "# Keep\n\nThis page must survive an explicit project typo.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/keep.md".into(),
+                    project: Some("typo".into()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await
+            .expect_err("unknown explicit project must not delete from scratch");
+        assert!(
+            err.to_string().contains("typo"),
+            "error should name the missing explicit project: {err}"
+        );
+
+        let read = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/keep.md".into()),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
+            .await;
+        assert!(read.is_ok(), "page must survive delete with typo'd project");
     }
 
     /// Bug 5 regression: when a project name lives in MULTIPLE workspaces,

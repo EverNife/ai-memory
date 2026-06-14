@@ -178,6 +178,34 @@ async fn search_with_empty_results_returns_empty_array() {
 }
 
 #[tokio::test]
+async fn search_rejects_partial_scope_instead_of_global_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let (state, _store) = make_admin_state(&tmp).await;
+    let app = admin_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/search?q=anything&workspace=default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("workspace and project must be provided together"),
+        "unexpected error body: {body}"
+    );
+}
+
+#[tokio::test]
 async fn search_limit_is_clamped_to_100() {
     // Server-side clamp prevents callers from requesting a million
     // hits; verify by passing a huge limit and ensuring we still get

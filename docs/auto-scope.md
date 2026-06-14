@@ -32,6 +32,13 @@ legacy behavior, but it is not per-session isolation; use explicit
 `workspace` + `project` arguments when a client cannot send actor
 identity and concurrent runs matter.
 
+Explicit scope arguments fail closed. A `project` argument is resolved
+inside the active workspace first, then inside the server's default
+workspace; if neither contains that project, the tool returns an error
+instead of falling back to the active/default project. A `workspace`
+argument must be paired with `project`, and read/admin maintenance
+paths use find-only lookups so typos do not create empty scopes.
+
 ## Configuration
 
 ```toml
