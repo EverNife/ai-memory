@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-06-15
+
 ### Fixed
 - Clarified architecture and auto-improvement design docs so CLI/admin
   auto-improvement is described as dry-run by default with explicit staging and
@@ -1097,7 +1099,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.8...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.9...HEAD
+[1.0.9]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.9
 [1.0.8]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.8
 [1.0.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.7
 [1.0.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.6
