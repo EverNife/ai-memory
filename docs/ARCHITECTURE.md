@@ -22,56 +22,15 @@ markdown stays the source of truth.
 
 ## Data flow
 
-```
-                ┌──────────────────────┐
-                │ Claude Code / Codex  │
-                │ Cursor / Gemini CLI  │
-                │ Antigravity / Grok   │
-                │ OpenClaw / OpenCode  │
-                │ OMP                  │
-                └──────────┬───────────┘
-   lifecycle hooks         │  stdio
-   (fire-and-forget HTTP)  ▼
-                ┌────────────────────────────────────────────┐
-                │   ai-memory serve  (one binary)            │
-                │ ┌────────────────┐  ┌────────────────────┐ │
-                │ │  /hook router  │  │ MCP server (rmcp)  │ │
-                │ │ (ai-memory-    │  │ stdio + streamable │ │
-                │ │  hooks)        │  │ HTTP /mcp          │ │
-                │ └────────┬───────┘  └─────────┬──────────┘ │
-                │          │ sanitize           │ tools/call │
-                │          ▼                    ▼            │
-                │       ┌────────────────────────────┐       │
-                │       │  WriterHandle (mpsc)       │       │
-                │       │  single dedicated thread,  │       │
-                │       │  one rusqlite Connection,  │       │
-                │       │  WAL mode, busy_timeout 5s │       │
-                │       └────────┬───────────┬───────┘       │
-                │                │           │               │
-                │  ┌─────────────▼──┐  ┌────▼──────────────┐ │
-                │  │ markdown wiki/ │  │ SQLite db/        │ │
-                │  │ (source of     │  │ memory.sqlite     │ │
-                │  │ truth + git)   │  │ (derived index)   │ │
-                │  └────────────────┘  │  - pages + FTS5   │ │
-                │           ▲          │  - observations   │ │
-                │ watcher   │          │  - handoffs       │ │
-                │ ▼─────────┘          │  - page_embeddings│ │
-                │   reconciliation     │  - audit_log      │ │
-                │   every 30s          └───────────────────┘ │
-                └────────────────────────────────────────────┘
-                  ▲                                       ▲
-                  │     scheduled / on-demand jobs        │
-            ┌─────┴───────────┐                  ┌────────┴─────┐
-            │ ai-memory       │                  │ ai-memory    │
-            │ consolidate     │                  │ forget-sweep │
-            │ (LLM-driven)    │                  │ (M8 decay)   │
-            └─────────────────┘                  └──────────────┘
-            ┌─────────────────┐                  ┌──────────────┐
-            │ ai-memory lint  │                  │ ai-memory    │
-            │ (rule + LLM)    │                  │ embed (M9    │
-            └─────────────────┘                  │ backfill)    │
-                                                 └──────────────┘
-```
+![ai-memory architecture overview](architecture-overview.svg)
+
+Solid arrows are request, read, and write paths. Dashed arrows are
+background reconciliation or provider-backed maintenance. The core invariant is
+unchanged: the markdown wiki is the source of truth, and SQLite is the derived
+index for search, sessions, observations, handoffs, audit, and embeddings.
+Auto-improvement sits on the provider-backed maintenance side: it reviews a
+completed session and returns validated proposals, but the shipped mode is
+dry-run-only and writes no wiki files or pending proposal pages.
 
 **Steady-state loop:**
 
@@ -95,16 +54,22 @@ markdown stays the source of truth.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
-5. `memory_query` answers via FTS5 + link-neighbour RRF; when an
+5. On explicit CLI/admin/MCP request, `auto-improve --dry-run` /
+   `memory_auto_improve` reviews one completed session with the configured LLM,
+   validates proposed `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and
+   `_rules/` edits, and returns a report. It does not run on SessionEnd by
+   default and does not write durable pages, pending proposals, handoffs, or
+   audit rows in the current release.
+6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
    the same RRF. If compiled wiki pages miss entirely, bounded raw
    observation FTS returns fallback `raw_hits`. Page hits bump
    `access_count` + `last_accessed_at` - the M8 reinforcement term.
-6. The forget sweep runs on demand and on the server's `[maintenance]`
+7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
    access get purged. Semantic / pinned / freshly-touched pages survive.
-7. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
+8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
 
@@ -224,7 +189,7 @@ crates/
 ├── ai-memory-mcp/         rmcp transport + tool router.
 ├── ai-memory-hooks/       payload schemas, sanitiser, /hook ingress.
 ├── ai-memory-llm/         provider auth boundary + LlmProvider / Embedder traits.
-├── ai-memory-consolidate/ Karpathy ingest / lint / sweep pipeline.
+├── ai-memory-consolidate/ Karpathy ingest / lint / sweep / auto-improve pipeline.
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 ```
 
@@ -268,7 +233,7 @@ end-to-end), `memory_auto_improve` exposes a safe default-on learning review
 without mutation, and `memory_delete_page` is the exact-path destructive pair
 needed by admission-aware mirrors. `memory_handoff_cancel` is the safety valve
 for mistaken handoff creation. The narrow-surface discipline still holds —
-every new tool has to earn its slot — but the v1 count is 15, not 10.
+every new tool has to earn its slot — but the v1 count is 16, not 10.
 
 MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
@@ -350,6 +315,19 @@ sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → soft-delete
 hard_delete_after_days = 180
+
+[auto_improve]                     # default-available, non-mutating review
+enabled = true
+mode = "dry_run"                   # stage / auto_apply are future modes
+on_session_end = false             # hooks never gain LLM latency on upgrade
+min_observations = 8
+min_session_duration_secs = 120
+min_confidence = 0.75
+max_input_tokens = 24000
+max_proposals_per_run = 5
+include_raw_fallback = false
+proposal_actor = "auto_improve"
+pending_path = "_pending/auto-improve"
 ```
 
 **LLM provider env** (opt-in):
@@ -394,6 +372,10 @@ LLM_API_KEY                    accepted for openai embeddings only with a custom
 * **Scheduled consolidation queue.** Forget sweep and lint already run
   on the server's maintenance schedule; a future queue can compile
   session summaries outside hook latency.
+* **Auto-improvement staging.** The shipped reviewer is dry-run-only; future
+  work is durable pending proposal storage under `_pending/auto-improve/` plus
+  list/diff/approve/reject flows that keep autonomous proposal attribution
+  separate from the approving human or agent.
 * **Multi-workspace UI / web dashboard.** Out of scope for v1; revisit
   once the headless server has been load-tested.
 * **Real LongMemEval-S harness.** The recall-eval framework exists
@@ -409,6 +391,8 @@ LLM_API_KEY                    accepted for openai embeddings only with a custom
 * [`docs/research-agentmemory.md`](research-agentmemory.md),
   [`research-basic-memory.md`](research-basic-memory.md),
   [`research-cognee.md`](research-cognee.md) - prior art studied.
+* [`docs/auto-improvement-loop.md`](auto-improvement-loop.md) -
+  Hermes Agent-inspired learning-loop research and safety boundaries.
 * [`docs/issues-*.md`](.) - concrete failure modes we've designed to
   avoid.
 * [`CLAUDE.md`](../CLAUDE.md) - per-session operating rules pinned
