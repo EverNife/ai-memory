@@ -145,19 +145,61 @@ pub fn get_or_create_project(
     Ok(id)
 }
 
-/// NULL out `repo_path` values that act as prefix-match catch-alls: the
-/// operator's home directory (`home`, when provided) and filesystem root
-/// (`/`). Such rows would prefix-match every project nested beneath them
-/// (issue #103). Idempotent; returns the number of rows healed. Targets
-/// ONLY those two sentinels -- get_or_create_project never re-populates a
-/// NULLed repo_path, so a broader heal would be destructive.
+/// NULL out `repo_path` values that act as longest-prefix-match catch-alls
+/// (issue #103), so every project nested beneath them stops resolving to the
+/// wrong row after upgrade. A one-shot startup heal; idempotent (a healed row
+/// is NULL and drops out of the candidate set, so a second pass heals 0).
+/// Returns the number of rows healed.
+///
+/// A row is healed when:
+/// - `repo_path` is one of the two broad sentinels -- filesystem root (`/`)
+///   or the operator's home directory (`home`, when provided). These are
+///   healed even if they happen to be git work-tree roots (e.g. a dotfiles
+///   repo checked out at `$HOME`): as prefix keys they swallow everything
+///   beneath them.
+/// - otherwise, `repo_path` EXISTS on this host but is NOT a git work-tree
+///   root (e.g. a bare `~/projects` cwd the original corruption captured).
+///
+/// A `repo_path` that does NOT exist on this host is left untouched: under a
+/// remote/multi-user daemon it may be a client path for another user, or a
+/// temporarily unmounted drive, and destroying it would wipe a valid prefix
+/// key. This safety rule is mandatory.
 pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> StoreResult<u64> {
-    let n = conn.execute(
-        "UPDATE projects SET repo_path = NULL \
-         WHERE repo_path = '/' OR (?1 IS NOT NULL AND repo_path = ?1)",
-        params![home],
-    )?;
-    Ok(u64::try_from(n).unwrap_or(0))
+    let candidates: Vec<(Vec<u8>, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let to_null: Vec<Vec<u8>> = candidates
+        .into_iter()
+        .filter(|(_, repo_path)| should_heal_repo_path(repo_path, home))
+        .map(|(id, _)| id)
+        .collect();
+    let tx = conn.transaction()?;
+    for id in &to_null {
+        tx.execute(
+            "UPDATE projects SET repo_path = NULL WHERE id = ?1",
+            params![id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(u64::try_from(to_null.len()).unwrap_or(0))
+}
+
+/// Decide whether a non-NULL `repo_path` is a prefix-match catch-all that
+/// should be NULLed. See [`heal_catch_all_repo_paths`] for the full rule.
+fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
+    if repo_path == "/" || home == Some(repo_path) {
+        return true; // broad sentinels, healed even if they look like git roots
+    }
+    let p = std::path::Path::new(repo_path);
+    // Non-existent paths (and stat errors) are left alone: multi-user/unmounted
+    // safety. An existing path is a catch-all unless it is a git work-tree root
+    // (a normal repo has a `.git` dir, a worktree/submodule a `.git` file).
+    matches!(p.try_exists(), Ok(true)) && !p.join(".git").exists()
 }
 
 fn scheduler_state_table_exists(conn: &Connection) -> StoreResult<bool> {
@@ -2885,10 +2927,12 @@ mod tests {
         assert_eq!(count("\"ui refresh\""), 1, "sub-token phrase must match");
     }
 
-    /// Issue #103 legacy heal: a one-shot startup pass NULLs `repo_path`
-    /// rows equal to the two prefix-match catch-alls ($HOME and `/`) so
-    /// existing broken installs self-correct on upgrade. Nested and NULL
-    /// rows are left untouched -- only the two sentinels are healed.
+    /// Issue #103 legacy heal: the two broad sentinels ($HOME and `/`) are
+    /// always NULLed. Here the inputs are non-existent fake paths, so the
+    /// nested row is preserved by the multi-user/unmounted safety rule (a
+    /// `repo_path` absent on this host is left alone), not merely because it
+    /// is non-sentinel -- the filesystem broadening is covered separately by
+    /// `heal_catch_all_repo_paths_uses_filesystem_to_judge_catch_alls`.
     #[test]
     fn heal_catch_all_repo_paths_nulls_home_and_root_only() {
         let (_tmp, mut conn, ws, _proj) = fresh_db();
@@ -2921,7 +2965,7 @@ mod tests {
         assert_eq!(
             read_repo_path(&conn, &nested),
             Some("/home/tester/projects/app".to_string()),
-            "nested project must be preserved"
+            "nested fake path does not exist on disk, so the safety rule preserves it"
         );
         assert_eq!(read_repo_path(&conn, &none), None, "NULL row stays NULL");
 
@@ -2930,6 +2974,65 @@ mod tests {
             heal_catch_all_repo_paths(&mut conn, Some("/home/tester")).unwrap(),
             0,
             "re-running the heal must be a no-op"
+        );
+    }
+
+    /// Filesystem broadening of the #103 heal: a real cwd captured as a
+    /// catch-all (a non-git ancestor like `~/projects`) is NULLed, a real git
+    /// work-tree root is preserved, and a path absent on this host is left
+    /// alone (multi-user/unmounted safety).
+    #[test]
+    fn heal_catch_all_repo_paths_uses_filesystem_to_judge_catch_alls() {
+        let (_tmp, mut conn, ws, _proj) = fresh_db();
+        let fixtures = TempDir::new().unwrap();
+
+        let read_repo_path = |conn: &Connection, id: &ProjectId| -> Option<String> {
+            conn.query_row(
+                "SELECT repo_path FROM projects WHERE id = ?1",
+                params![id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // Real non-git ancestor (the legacy `~/projects`-style catch-all).
+        let non_git = fixtures.path().join("projects");
+        std::fs::create_dir_all(&non_git).unwrap();
+        let non_git_path = non_git.to_str().unwrap().to_string();
+        let non_git_proj =
+            get_or_create_project(&mut conn, &ws, "non_git", Some(&non_git_path)).unwrap();
+
+        // Real git work-tree root (legitimate prefix key).
+        let git_root = fixtures.path().join("repo");
+        std::fs::create_dir_all(git_root.join(".git")).unwrap();
+        let git_path = git_root.to_str().unwrap().to_string();
+        let git_proj = get_or_create_project(&mut conn, &ws, "git_root", Some(&git_path)).unwrap();
+
+        // Path absent on this host (do NOT create it).
+        let gone = fixtures.path().join("gone");
+        let gone_path = gone.to_str().unwrap().to_string();
+        let gone_proj = get_or_create_project(&mut conn, &ws, "gone", Some(&gone_path)).unwrap();
+
+        let healed = heal_catch_all_repo_paths(&mut conn, None).unwrap();
+        assert_eq!(
+            healed, 1,
+            "only the real non-git catch-all should be healed"
+        );
+
+        assert_eq!(
+            read_repo_path(&conn, &non_git_proj),
+            None,
+            "real non-git ancestor must be healed"
+        );
+        assert_eq!(
+            read_repo_path(&conn, &git_proj),
+            Some(git_path),
+            "real git work-tree root must be preserved"
+        );
+        assert_eq!(
+            read_repo_path(&conn, &gone_proj),
+            Some(gone_path),
+            "path absent on this host must be preserved (multi-user/unmounted safety)"
         );
     }
 }
