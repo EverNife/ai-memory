@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain so a heavy session keeps the backlog flat instead of waiting for the next
   session boundary. Tunable via `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD`
   (default 32 events).
+- Added [`docs/macos.md`](docs/macos.md) covering macOS install paths (prebuilt
+  release binary, source build, and the Docker wrapper) and the `posix` vs
+  `posix-native` hook platform split, with troubleshooting notes for macOS
+  wrapper and hook-discovery issues. Linked it from the README support matrix, the docs
+  table, and `docs/install.md`, and bundled it into the macOS release tarballs
+  alongside `docs/install.md` (mirroring how the Windows zip ships
+  `docs/windows.md`).
 
 ### Fixed
 - Bounded heuristic session-page raw observation dumps and single-page
