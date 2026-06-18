@@ -124,6 +124,24 @@ if command -v git >/dev/null 2>&1; then
     assert_eq "explicit project pin beats repo-root" \
         "&cwd=$REPO/crates/cli&workspace=oss&project=pinned&project_strategy=repo-root" \
         "$QSP"
+
+    PSH=""
+    if command -v pwsh >/dev/null 2>&1; then
+        PSH=$(command -v pwsh)
+    elif command -v powershell >/dev/null 2>&1; then
+        PSH=$(command -v powershell)
+    fi
+    if [ -n "$PSH" ]; then
+        PS_REPO=$($PSH -NoProfile -ExecutionPolicy Bypass -Command \
+            ". '$PWD/hooks/lib/ai-memory-hook.ps1'; Get-AiMemoryRepoRootProject -Cwd '$REPO/crates/cli'")
+        assert_eq "powershell repo-root helper resolves repo basename" "acme-api" "$PS_REPO"
+    else
+        PS_STATIC=$(grep -q 'function Get-AiMemoryRepoRootProject' hooks/lib/ai-memory-hook.ps1 \
+            && grep -q -- '--git-common-dir' hooks/lib/ai-memory-hook.ps1 \
+            && grep -q 'Get-AiMemoryRepoRootProject -Cwd' hooks/lib/ai-memory-hook.ps1 \
+            && printf 'ok' || printf 'missing')
+        assert_eq "powershell repo-root helper has static parity" "ok" "$PS_STATIC"
+    fi
 fi
 
 # --- url_encode -------------------------------------------------------
