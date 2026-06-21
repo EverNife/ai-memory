@@ -3386,9 +3386,9 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             // Two-condition LIKE: exact match OR descendant (prefix +
             // `/`). The boundary `/` on the descendant arm stops
-            // `/foo/bar` from matching `/foo/ba`. The WHERE filters
-            // reject any stored repo_path that would slip past the
-            // boundary (empty, `/`, trailing-slash, LIKE wildcards).
+            // `/foo/bar` from matching `/foo/ba`. The LIKE arm escapes
+            // stored wildcard characters so real paths containing `%` or
+            // `_` stay literal instead of turning into broad matches.
             let row_opt = conn
                 .query_row(
                     "SELECT id, name FROM projects \
@@ -3396,10 +3396,8 @@ impl ReaderPool {
                        AND repo_path IS NOT NULL \
                        AND length(repo_path) > 1 \
                        AND repo_path NOT LIKE '%/' \
-                       AND repo_path NOT LIKE '%\\%%' ESCAPE '\\' \
-                       AND repo_path NOT LIKE '%\\_%' ESCAPE '\\' \
                        AND (?3 IS NULL OR repo_path <> ?3) \
-                       AND (?2 = repo_path OR ?2 LIKE repo_path || '/%') \
+                       AND (?2 = repo_path OR ?2 LIKE replace(replace(replace(repo_path, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\') \
                      ORDER BY length(repo_path) DESC \
                      LIMIT 1",
                     params![workspace_id.as_bytes(), cwd_norm, home],

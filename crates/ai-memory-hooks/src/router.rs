@@ -543,11 +543,14 @@ async fn resolve_project_ids(
         project: &str,
         strategy: ProjectStrategy,
     ) -> Option<String> {
-        if matches!(strategy, ProjectStrategy::RepoRoot)
-            && let Some((name, Some(root))) = derive_project_from_cwd(cwd, strategy)
-            && name == project
-        {
-            return Some(root);
+        if matches!(strategy, ProjectStrategy::RepoRoot) {
+            let cwd_path = std::path::Path::new(cwd);
+            if let Ok(root) = ai_memory_consolidate::discover_main_repo_root(cwd_path) {
+                let visible_root = repo_root_in_cwd_namespace(cwd_path, &root);
+                if visible_root.file_name().and_then(|name| name.to_str()) == Some(project) {
+                    return Some(visible_root.to_string_lossy().into_owned());
+                }
+            }
         }
         repo_path_from_cwd(cwd)
     }
