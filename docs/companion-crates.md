@@ -174,6 +174,16 @@ Re-home by kind:
 
 This is the companion shape for PR #123.
 
+Status: **undecided**. Do not implement this companion yet without a fresh design
+review. The useful writable version is larger than it first appears: it needs a
+safe core compare-and-write seam, a companion mutation broker, browser auth/CSRF,
+confirmation state, diffing, conflict handling, audit, and later LLM proposal
+policy. It is not clear that this complexity brings enough benefit for
+ai-memory's main goal. The system is meant to auto-improve its own memory through
+capture, consolidation, review, pending writes, and eval gates; manual memory
+editing may be less valuable than it seems, and could distract from improving the
+automatic loop.
+
 ### Goal
 
 Offer a richer browser product for chat, editing, and curation without turning
@@ -247,6 +257,8 @@ Mutation flow:
   browser endpoints for this product.
 
 ### Implementation plan
+
+This plan is intentionally parked until the benefit is clearer.
 
 1. Build a read-only editor shell against `/api/v1` first.
 2. Add chat over selected page/search context, still read-only.
