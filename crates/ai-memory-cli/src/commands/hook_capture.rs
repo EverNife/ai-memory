@@ -193,8 +193,9 @@ pub enum BatchOutcome {
     /// `404`/`405` — the server has no `/hook/batch` (a pre-upgrade build). The
     /// caller falls back to per-event `POST /hook` for the rest of the drain.
     Unsupported,
-    /// Transport error or any other non-2xx: the batch didn't land. Treated as a
-    /// failed attempt for each item it carried (bounded by `MAX_ATTEMPTS`).
+    /// Transport error or any other non-2xx: the batch outcome is unknown. The
+    /// drain charges conservatively so trailing events that may never have been
+    /// attempted do not burn retry budget.
     Failed,
 }
 

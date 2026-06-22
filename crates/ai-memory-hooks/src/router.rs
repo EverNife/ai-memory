@@ -41,6 +41,11 @@ use crate::synth::synthesize_session_page;
 /// callers can drop or retry instead of growing memory without bound.
 pub const DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT: usize = 1024;
 
+/// Maximum events accepted in one `POST /hook/batch` request. This matches the
+/// client drain cap so a single request cannot monopolize ingest capacity or
+/// allocate/process an unbounded vector of hook events.
+pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
+
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
@@ -261,14 +266,31 @@ async fn handle_hook_batch(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(items): Json<Vec<HookBatchItem>>,
 ) -> impl IntoResponse {
+    if items.len() > MAX_HOOK_BATCH_ITEMS {
+        warn!(
+            items = items.len(),
+            max = MAX_HOOK_BATCH_ITEMS,
+            "hook batch too large; rejecting before processing"
+        );
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(HookBatchAck { accepted: 0 }),
+        );
+    }
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
     let actor_user = actor_ext
         .map(|axum::Extension(ctx)| ctx.user)
         .unwrap_or_default();
-    // One permit for the whole batch — it holds ingest capacity for its
-    // duration, exactly as a single in-flight `/hook` request would.
-    let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
+    // Hold capacity proportional to the batch size so batch ingress cannot
+    // exceed the same in-flight event bound as single `/hook` requests. Empty
+    // batches still acquire one permit to respect backpressure consistently.
+    let permits = u32::try_from(items.len().max(1)).unwrap_or(u32::MAX);
+    let Ok(permit) = state
+        .ingest_semaphore
+        .clone()
+        .try_acquire_many_owned(permits)
+    else {
         warn!("hook batch ingest saturated; rejecting with 429");
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1238,6 +1260,52 @@ mod tests {
         )
         .await
         .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_rejects_over_client_item_cap() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let items: Vec<HookBatchItem> = (0..=MAX_HOOK_BATCH_ITEMS)
+            .map(|i| HookBatchItem {
+                url: format!("http://h/hook?event=user-prompt-submit&agent=claude-code&i={i}"),
+                body: serde_json::json!({ "session_id": "too-many", "prompt": "nope" }),
+            })
+            .collect();
+
+        let response = handle_hook_batch(State(Arc::new(state)), None, Json(items))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 0);
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_acquires_capacity_per_item() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                body: serde_json::json!({ "session_id": "bounded-batch" }),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({ "session_id": "bounded-batch", "prompt": "hello" }),
+            },
+        ];
+
+        let response = handle_hook_batch(State(Arc::new(state)), None, Json(items))
+            .await
+            .into_response();
+
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 

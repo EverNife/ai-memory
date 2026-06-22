@@ -211,64 +211,75 @@ pub async fn drain(
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut result = DrainResult::default();
 
-    // Load entries oldest-first, dropping unparseable / too-old files up front
-    // (a long-dead instance must not keep the spool growing). The batch path
-    // then only ever sees live, parseable events.
-    let mut items: Vec<(PathBuf, SpoolEntry)> = Vec::with_capacity(files.len());
-    for path in files {
-        let Ok(bytes) = std::fs::read(&path) else {
-            result.remaining += 1;
-            continue;
-        };
-        let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
-            // Unparseable spool file: drop it so it can't wedge the queue.
-            let _ = std::fs::remove_file(&path);
-            result.dropped += 1;
-            continue;
-        };
-        if now_ms().saturating_sub(entry.created_ms) > MAX_AGE_MS {
-            let _ = std::fs::remove_file(&path);
-            result.dropped += 1;
-            continue;
-        }
-        items.push((path, entry));
-    }
-
     let mut idx = 0;
     let mut batch_supported = true;
-    while idx < items.len() {
+    'drain: while idx < files.len() {
         if started.elapsed() >= total_budget {
-            result.remaining += items.len() - idx;
+            result.remaining += files.len() - idx;
             break;
         }
 
-        let bearer = entry_bearer(&items[idx].1, &client, data_dir, &mut oidc_cache).await;
+        let path = files[idx].clone();
+        idx += 1;
+        let Some(entry) = load_live_entry(&path, &mut result) else {
+            continue;
+        };
+        if body_is_malformed(&entry) {
+            bump_or_drop(&path, &entry, &mut result);
+            continue;
+        }
+
+        let bearer = entry_bearer(&entry, &client, data_dir, &mut oidc_cache).await;
 
         if batch_supported {
             // Extend the chunk over consecutive entries sharing the same batch
             // endpoint AND bearer (one request carries one Authorization header),
             // bounded by item count and body bytes.
-            let base = batch_endpoint(&items[idx].1.url);
-            let mut end = idx + 1;
-            let mut bytes = entry_wire_len(&items[idx].1);
-            while end < items.len() && end - idx < MAX_BATCH_ITEMS {
-                if batch_endpoint(&items[end].1.url) != base {
+            let base = batch_endpoint(&entry.url);
+            let mut bytes = entry_wire_len(&entry);
+            let mut chunk = Vec::with_capacity(MAX_BATCH_ITEMS.min(files.len() - idx + 1));
+            chunk.push((path, entry));
+            while idx < files.len() && chunk.len() < MAX_BATCH_ITEMS {
+                if started.elapsed() >= total_budget {
+                    break;
+                }
+                let next_path = files[idx].clone();
+                idx += 1;
+                let Some(next_entry) = load_live_entry(&next_path, &mut result) else {
+                    continue;
+                };
+                if body_is_malformed(&next_entry) {
+                    bump_or_drop(&next_path, &next_entry, &mut result);
+                    continue;
+                }
+                if batch_endpoint(&next_entry.url) != base {
+                    idx -= 1;
                     break;
                 }
                 let next_bearer =
-                    entry_bearer(&items[end].1, &client, data_dir, &mut oidc_cache).await;
+                    entry_bearer(&next_entry, &client, data_dir, &mut oidc_cache).await;
                 if next_bearer != bearer {
+                    idx -= 1;
                     break;
                 }
-                let next_len = entry_wire_len(&items[end].1);
+                let next_len = entry_wire_len(&next_entry);
                 if bytes + next_len > MAX_BATCH_BYTES {
+                    idx -= 1;
                     break;
                 }
                 bytes += next_len;
-                end += 1;
+                chunk.push((next_path, next_entry));
             }
 
-            let payload = batch_payload(&items[idx..end]);
+            let Some(payload) = batch_payload(&chunk) else {
+                bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                result.remaining += chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
+                break;
+            };
+            if started.elapsed() >= total_budget {
+                result.remaining += chunk.len() + files.len().saturating_sub(idx);
+                break;
+            }
             match post_batch(
                 &client,
                 &base,
@@ -279,49 +290,80 @@ pub async fn drain(
             .await
             {
                 BatchOutcome::Accepted(k) => {
-                    let k = k.min(end - idx);
-                    for (path, _) in &items[idx..idx + k] {
+                    let k = k.min(chunk.len());
+                    for (path, _) in &chunk[..k] {
                         let _ = std::fs::remove_file(path);
                     }
                     result.sent += k;
-                    if idx + k < end {
+                    if k < chunk.len() {
                         // The (idx+k)th event is the one the server stopped on
                         // (fail-fast). Charge it a failed attempt and skip past it
                         // so a single bad event can't wedge the rest — the
                         // per-event loop also advances past a failed entry.
-                        bump_or_drop(&items[idx + k].0, &items[idx + k].1, &mut result);
-                        idx += k + 1;
-                    } else {
-                        idx = end;
+                        bump_or_drop(&chunk[k].0, &chunk[k].1, &mut result);
+                        result.remaining +=
+                            chunk.len().saturating_sub(k + 1) + files.len().saturating_sub(idx);
+                        break;
                     }
                 }
                 BatchOutcome::Saturated => {
                     // Server ingest is full; further batches would 429 too. Leave
                     // everything queued, no attempt bump (parity with per-event).
-                    result.remaining += items.len() - idx;
+                    result.remaining += chunk.len() + files.len().saturating_sub(idx);
                     break;
                 }
                 BatchOutcome::Unsupported => {
                     // Pre-upgrade server with no /hook/batch: fall back to the
-                    // per-event path for the rest of the drain. Retry items[idx]
-                    // below (don't advance).
+                    // per-event path for the current chunk and the rest of the
+                    // drain. Do not rewind: entries skipped while building this
+                    // chunk (unparseable/stale/malformed) have already been
+                    // handled locally and must not be charged twice.
                     batch_supported = false;
+                    for (pos, (path, entry)) in chunk.iter().enumerate() {
+                        if started.elapsed() >= total_budget {
+                            result.remaining += chunk.len() - pos + files.len().saturating_sub(idx);
+                            break 'drain;
+                        }
+                        let item_bearer =
+                            entry_bearer(entry, &client, data_dir, &mut oidc_cache).await;
+                        match post_hook(
+                            &client,
+                            &entry.url,
+                            &entry.body,
+                            item_bearer.as_deref(),
+                            per_event_timeout,
+                        )
+                        .await
+                        {
+                            PostOutcome::Delivered => {
+                                let _ = std::fs::remove_file(path);
+                                result.sent += 1;
+                            }
+                            PostOutcome::Saturated => {
+                                result.remaining += 1;
+                            }
+                            PostOutcome::Failed => {
+                                bump_or_drop(path, entry, &mut result);
+                            }
+                        }
+                    }
                 }
                 BatchOutcome::Failed => {
                     // The batch didn't land (transport error / unexpected status).
-                    // Charge each item a failed attempt so a dead server still
-                    // bounds retries via MAX_ATTEMPTS, then move past the chunk.
-                    for (path, entry) in &items[idx..end] {
-                        bump_or_drop(path, entry, &mut result);
-                    }
-                    idx = end;
+                    // The server may have processed none, some, or all items before
+                    // the client saw the failure. Charge only the first item
+                    // conservatively and leave the rest queued for a future pass so
+                    // a timeout cannot burn attempts for events that may never have
+                    // been attempted.
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    result.remaining +=
+                        chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
+                    break;
                 }
             }
         } else {
             // Per-event fallback (server without /hook/batch). Mirrors the
             // original drain's per-entry semantics exactly.
-            let path = &items[idx].0;
-            let entry = &items[idx].1;
             match post_hook(
                 &client,
                 &entry.url,
@@ -339,13 +381,35 @@ pub async fn drain(
                     result.remaining += 1;
                 }
                 PostOutcome::Failed => {
-                    bump_or_drop(path, entry, &mut result);
+                    bump_or_drop(&path, &entry, &mut result);
                 }
             }
-            idx += 1;
         }
     }
     result
+}
+
+fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> {
+    let Ok(bytes) = std::fs::read(path) else {
+        result.remaining += 1;
+        return None;
+    };
+    let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
+        // Unparseable spool file: drop it so it can't wedge the queue.
+        let _ = std::fs::remove_file(path);
+        result.dropped += 1;
+        return None;
+    };
+    if now_ms().saturating_sub(entry.created_ms) > MAX_AGE_MS {
+        let _ = std::fs::remove_file(path);
+        result.dropped += 1;
+        return None;
+    }
+    Some(entry)
+}
+
+fn body_is_malformed(entry: &SpoolEntry) -> bool {
+    serde_json::from_str::<serde_json::Value>(&entry.body).is_err()
 }
 
 /// Resolve the bearer for a spooled entry at drain time: a `Static` token is
@@ -384,19 +448,17 @@ fn entry_wire_len(entry: &SpoolEntry) -> usize {
 }
 
 /// Serialize a chunk of entries into the `/hook/batch` request body — a JSON
-/// array of `{url, body}`. Each `body` is re-parsed from its stored text so a
-/// malformed one becomes `null` (skipped server-side) instead of poisoning the
-/// whole batch.
-fn batch_payload(items: &[(PathBuf, SpoolEntry)]) -> String {
-    let arr: Vec<serde_json::Value> = items
+/// array of `{url, body}`. Each `body` is re-parsed from its stored text; a
+/// malformed body is a local retry/drop condition, never synthesized as `null`.
+fn batch_payload(items: &[(PathBuf, SpoolEntry)]) -> Option<String> {
+    let arr: Result<Vec<serde_json::Value>, serde_json::Error> = items
         .iter()
         .map(|(_, e)| {
-            let body = serde_json::from_str::<serde_json::Value>(&e.body)
-                .unwrap_or(serde_json::Value::Null);
-            serde_json::json!({ "url": e.url, "body": body })
+            let body = serde_json::from_str::<serde_json::Value>(&e.body)?;
+            Ok(serde_json::json!({ "url": e.url, "body": body }))
         })
         .collect();
-    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string(&arr.ok()?).ok()
 }
 
 /// Charge a spooled entry a failed delivery attempt: drop it once it reaches
@@ -733,12 +795,21 @@ mod tests {
         req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         batch_status: &'static str,
     ) -> String {
+        serve_counting_hook_with_accept(req_count, batch_status, None).await
+    }
+
+    async fn serve_counting_hook_with_accept(
+        req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        batch_status: &'static str,
+        accepted_override: Option<usize>,
+    ) -> String {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut s, _)) = listener.accept().await {
                 let rc = req_count.clone();
+                let accepted_override = accepted_override;
                 tokio::spawn(async move {
                     let mut buf = vec![0_u8; 65536];
                     let n = s.read(&mut buf).await.unwrap_or(0);
@@ -750,10 +821,12 @@ mod tests {
                         .is_some_and(|l| l.contains("/hook/batch"));
                     let (status, body) = if is_batch {
                         let payload = req.split("\r\n\r\n").nth(1).unwrap_or("");
-                        let accepted = serde_json::from_str::<serde_json::Value>(payload)
-                            .ok()
-                            .and_then(|v| v.as_array().map(Vec::len))
-                            .unwrap_or(0);
+                        let accepted = accepted_override.unwrap_or_else(|| {
+                            serde_json::from_str::<serde_json::Value>(payload)
+                                .ok()
+                                .and_then(|v| v.as_array().map(Vec::len))
+                                .unwrap_or(0)
+                        });
                         (batch_status, format!("{{\"accepted\":{accepted}}}"))
                     } else {
                         ("202 Accepted", "queued".to_string())
@@ -770,9 +843,53 @@ mod tests {
     }
 
     fn write_spool_entry(spool: &Path, name: &str, url: String) {
+        write_spool_entry_with_body(spool, name, url, "{}".into());
+    }
+
+    fn write_spool_entry_with_body(spool: &Path, name: &str, url: String, body: String) {
         std::fs::create_dir_all(spool).unwrap();
-        let e = entry_for(url, "{}".into(), None, false);
+        let e = entry_for(url, body, None, false);
         std::fs::write(spool.join(name), serde_json::to_vec(&e).unwrap()).unwrap();
+    }
+
+    fn write_spool_entry_with_token(spool: &Path, name: &str, url: String, token: &str) {
+        std::fs::create_dir_all(spool).unwrap();
+        let e = entry_for(url, "{}".into(), Some(token), false);
+        std::fs::write(spool.join(name), serde_json::to_vec(&e).unwrap()).unwrap();
+    }
+
+    fn sorted_attempts(spool: &Path) -> Vec<u32> {
+        let mut files = list_entries(spool).unwrap();
+        files.sort();
+        files
+            .iter()
+            .map(|path| {
+                serde_json::from_slice::<SpoolEntry>(&std::fs::read(path).unwrap())
+                    .unwrap()
+                    .attempts
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn zero_budget_does_not_deserialize_or_drop_entries() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(&spool, "evt-0.json", format!("http://{addr}/hook?event=e0"));
+        std::fs::write(spool.join("evt-1.json"), b"not a spool entry").unwrap();
+
+        let r = drain(&spool, tmp.path(), Duration::ZERO, Duration::from_secs(2)).await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(
+            r.dropped, 0,
+            "zero budget must not pre-parse and drop bad files"
+        );
+        assert_eq!(r.remaining, 2);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(list_entries(&spool).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -839,6 +956,207 @@ mod tests {
             3,
             "one /hook/batch 404, then a per-event POST per remaining event"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_batch_charges_only_first_item() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "500 Internal Server Error").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{addr}/hook?event=e{i}"),
+            );
+        }
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(r.dropped, 0);
+        assert_eq!(r.remaining, 3);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut files = list_entries(&spool).unwrap();
+        files.sort();
+        let attempts: Vec<u32> = files
+            .iter()
+            .map(|path| {
+                serde_json::from_slice::<SpoolEntry>(&std::fs::read(path).unwrap())
+                    .unwrap()
+                    .attempts
+            })
+            .collect();
+        assert_eq!(attempts, vec![1, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn partial_batch_ack_deletes_prefix_and_charges_only_failed_item() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook_with_accept(req_count.clone(), "200 OK", Some(1)).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{addr}/hook?event=e{i}"),
+            );
+        }
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1);
+        assert_eq!(r.dropped, 0);
+        assert_eq!(r.remaining, 2);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut files = list_entries(&spool).unwrap();
+        files.sort();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].ends_with("evt-1.json"));
+        assert!(files[1].ends_with("evt-2.json"));
+        assert_eq!(sorted_attempts(&spool), vec![1, 0]);
+    }
+
+    #[tokio::test]
+    async fn endpoint_change_splits_batches_without_losing_rewound_entry() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/a/hook?event=e0"),
+        );
+        write_spool_entry(
+            &spool,
+            "evt-1.json",
+            format!("http://{addr}/b/hook?event=e1"),
+        );
+        write_spool_entry(
+            &spool,
+            "evt-2.json",
+            format!("http://{addr}/a/hook?event=e2"),
+        );
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 3);
+        assert_eq!(r.remaining, 0);
+        assert!(list_entries(&spool).unwrap().is_empty());
+        assert_eq!(
+            req_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "each endpoint boundary should start a separate batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_change_splits_batches_without_burning_attempts() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry_with_token(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=e0"),
+            "token-a",
+        );
+        write_spool_entry_with_token(
+            &spool,
+            "evt-1.json",
+            format!("http://{addr}/hook?event=e1"),
+            "token-b",
+        );
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 2);
+        assert_eq!(r.remaining, 0);
+        assert!(list_entries(&spool).unwrap().is_empty());
+        assert_eq!(
+            req_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "different bearer tokens require separate batch requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_body_is_charged_locally_not_sent_as_null() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry_with_body(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=e0"),
+            "{\"ok\":true}".into(),
+        );
+        write_spool_entry_with_body(
+            &spool,
+            "evt-1.json",
+            format!("http://{addr}/hook?event=e1"),
+            "not-json".into(),
+        );
+        write_spool_entry_with_body(
+            &spool,
+            "evt-2.json",
+            format!("http://{addr}/hook?event=e2"),
+            "{\"ok\":true}".into(),
+        );
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 2);
+        assert_eq!(r.dropped, 0);
+        assert_eq!(r.remaining, 1);
+        assert_eq!(
+            req_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only valid bodies are sent in the batch"
+        );
+
+        let files = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1);
+        let remaining: SpoolEntry =
+            serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(remaining.body, "not-json");
+        assert_eq!(remaining.attempts, 1);
     }
 
     #[test]
