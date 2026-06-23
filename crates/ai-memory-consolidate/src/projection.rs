@@ -7,6 +7,8 @@ use ai_memory_core::{Observation, ObservationKind};
 const DEFAULT_EVEN_SAMPLE_BUCKETS: usize = 16;
 const MAX_RENDERED_TITLE_CHARS: usize = 500;
 const MAX_RENDERED_SOURCE_CHARS: usize = 128;
+const EVEN_SAMPLE_SCORE: i32 = 20;
+const MAX_RECENCY_SCORE: i32 = 80;
 
 /// Budget and rendering controls for observation projection.
 #[derive(Debug, Clone)]
@@ -291,7 +293,7 @@ fn select_observation_indices(observations: &[Observation], limit: usize) -> Vec
         .map(|(idx, obs)| {
             let mut score = observation_score(obs, idx, observations.len());
             if even.contains(&idx) {
-                score += 40;
+                score += EVEN_SAMPLE_SCORE;
             }
             (score, idx)
         })
@@ -345,6 +347,7 @@ fn is_hard_anchor(observations: &[Observation], idx: usize) -> bool {
 
 fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
     let mut score = i32::from(obs.importance);
+    score += recency_score(idx, total);
     score += match obs.kind {
         ObservationKind::UserPrompt => 100,
         ObservationKind::SessionEnd => 95,
@@ -377,6 +380,13 @@ fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
         score -= 80;
     }
     score
+}
+
+fn recency_score(idx: usize, total: usize) -> i32 {
+    if total <= 1 {
+        return 0;
+    }
+    (idx.saturating_mul(MAX_RECENCY_SCORE as usize) / (total - 1)) as i32
 }
 
 fn has_high_signal_terms(obs: &Observation) -> bool {
@@ -525,6 +535,37 @@ mod tests {
         assert_eq!(projected.selected_indices.first().copied(), Some(0));
         assert_eq!(projected.selected_indices.last().copied(), Some(39));
         assert!(projected.text.contains("observations omitted"));
+    }
+
+    #[test]
+    fn long_session_selection_prefers_later_corrections_without_losing_anchors_or_sampling() {
+        let mut observations: Vec<_> = (0..80)
+            .map(|idx| obs(idx, ObservationKind::PostToolUse, "routine", "boring", 3))
+            .collect();
+        observations[78] = obs(
+            78,
+            ObservationKind::PostToolUse,
+            "final correction",
+            "final state supersedes earlier draft",
+            3,
+        );
+        observations[79] = obs(79, ObservationKind::SessionEnd, "session end", "done", 5);
+
+        let projected = project_observations(
+            &observations,
+            &ObservationProjectionConfig::new(20_000, 8, 200),
+        );
+
+        assert_eq!(projected.selected_indices.first().copied(), Some(0));
+        assert_eq!(projected.selected_indices.last().copied(), Some(79));
+        assert!(projected.selected_indices.contains(&78));
+        let even = even_sample_indices(observations.len());
+        assert!(
+            projected
+                .selected_indices
+                .iter()
+                .any(|idx| !is_hard_anchor(&observations, *idx) && even.contains(idx))
+        );
     }
 
     #[test]

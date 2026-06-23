@@ -22,6 +22,11 @@ the current page body provided. Do NOT:
 If the session yields nothing durable beyond the narrative,
 return a short session log with no fabricated structure.
 
+When later observations in the same session contradict earlier
+observations, treat the most recent/final state as authoritative.
+Superseded drafts, plans, errors, or assumptions may be mentioned as
+history only when useful, but must not be presented as current fact.
+
 ## Style rules
 
 1. Title: short, descriptive (≤ 80 chars). No filler.

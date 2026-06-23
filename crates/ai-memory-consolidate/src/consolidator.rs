@@ -800,6 +800,15 @@ mod tests {
     }
 
     #[test]
+    fn consolidation_system_prompts_treat_later_same_session_state_as_authoritative() {
+        let guidance = "most recent/final state as authoritative";
+        assert!(SYSTEM_PROMPT.contains(guidance));
+        assert!(BATCH_SYSTEM_PROMPT.contains(guidance));
+        assert!(SYSTEM_PROMPT.contains("must not be presented as current fact"));
+        assert!(BATCH_SYSTEM_PROMPT.contains("must not be presented as current fact"));
+    }
+
+    #[test]
     fn build_request_elides_raw_observations_from_current_body() {
         let raw_dump = (0..2_000)
             .map(|i| format!("- `other` @ 1970-01-01T00:00:00Z — raw-entry-{i}"))

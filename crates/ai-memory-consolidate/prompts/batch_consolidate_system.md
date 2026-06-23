@@ -11,6 +11,11 @@ restating the durable signal that exists in the observations
 provided. Every claim in every page MUST be grounded in the
 observations.
 
+When later observations in the same session contradict earlier
+observations, treat the most recent/final state as authoritative.
+Superseded drafts, plans, errors, or assumptions may be mentioned as
+history only when useful, but must not be presented as current fact.
+
 Do NOT:
 - Invent dates, timestamps, version numbers, commit hashes,
   author names, file paths, function names, line numbers, error

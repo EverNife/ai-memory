@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Long-session consolidation now favors later same-session corrections when the
+  observation projection cap forces sampling, and both consolidation prompts now
+  instruct the model to treat the most recent/final state as authoritative when
+  observations contradict earlier drafts.
+
 ## [1.2.1] - 2026-06-23
 
 ### Fixed
