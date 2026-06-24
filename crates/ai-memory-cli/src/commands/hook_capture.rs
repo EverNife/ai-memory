@@ -533,4 +533,74 @@ project_strategy = "repo-root"
         assert!(qs.contains("&project=acme-api"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
     }
+
+    // ── install-time default strategy (#128), no marker required ──────
+
+    #[test]
+    fn marker_query_suffix_default_repo_root_non_git_keeps_project_implicit() {
+        // Baked repo-root default, no marker, not a git tree: the strategy is
+        // forwarded but no project is derived (server falls back to basename).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let child = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&child).unwrap();
+        let qs = marker_query_suffix(child.to_str().unwrap(), Some("repo-root"));
+        assert!(!qs.contains("&project="), "{qs}");
+        assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+    }
+
+    #[test]
+    fn marker_query_suffix_default_repo_root_collapses_git_subdir() {
+        // Baked repo-root default, no marker, inside a git subdir: the project
+        // collapses to the repo-root basename.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("contentcreator");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sub = repo.join("transcripts");
+        std::fs::create_dir_all(&sub).unwrap();
+        let qs = marker_query_suffix(sub.to_str().unwrap(), Some("repo-root"));
+        assert!(qs.contains("&project=contentcreator"), "{qs}");
+        assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+    }
+
+    #[test]
+    fn marker_query_suffix_marker_strategy_overrides_default() {
+        // A marker that pins `project_strategy = "basename"` wins over the
+        // install-time repo-root default — no repo-root derivation happens.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "project_strategy = \"basename\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), Some("repo-root"));
+        assert!(qs.contains("&project_strategy=basename"), "{qs}");
+        assert!(!qs.contains("repo-root"), "{qs}");
+        assert!(!qs.contains("&project="), "{qs}");
+    }
+
+    #[test]
+    fn marker_query_suffix_marker_project_overrides_default_repo_root() {
+        // A marker's explicit `project` wins over repo-root derivation, while
+        // the baked default strategy is still forwarded.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".ai-memory.toml"), "project = \"pinned\"\n").unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), Some("repo-root"));
+        assert!(qs.contains("&project=pinned"), "{qs}");
+        assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+    }
 }
