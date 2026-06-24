@@ -202,7 +202,7 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Openclaw => {
-            openclaw_plugin::render(&server_url, auth);
+            openclaw_plugin::render(&server_url, auth, strategy);
             Ok(())
         }
     }
