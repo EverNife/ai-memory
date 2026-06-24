@@ -1582,6 +1582,51 @@ mod tests {
     }
 
     #[test]
+    fn install_hooks_project_strategy_repo_root_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--project-strategy",
+            "repo-root",
+        ])
+        .unwrap_or_else(|e| panic!("failed to parse --project-strategy repo-root: {e}"));
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks command");
+        };
+        assert!(matches!(
+            args.project_strategy,
+            ProjectStrategyArg::RepoRoot
+        ));
+        assert_eq!(args.project_strategy.baked(), Some("repo-root"));
+    }
+
+    #[test]
+    fn install_hooks_project_strategy_defaults_to_basename() {
+        let cli = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "claude-code"])
+            .expect("install-hooks parses without --project-strategy");
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks command");
+        };
+        assert!(matches!(
+            args.project_strategy,
+            ProjectStrategyArg::Basename
+        ));
+        assert_eq!(args.project_strategy.baked(), None);
+    }
+
+    #[test]
+    fn install_hooks_project_strategy_rejects_invalid_value() {
+        let result =
+            Cli::try_parse_from(["ai-memory", "install-hooks", "--project-strategy", "bogus"]);
+        assert!(
+            result.is_err(),
+            "an unknown --project-strategy value must be rejected by value_enum"
+        );
+    }
+
+    #[test]
     fn vscode_copilot_aliases_parse_to_same_variant() {
         for alias in ["vscode-copilot", "copilot", "github-copilot"] {
             let cli = Cli::try_parse_from([
