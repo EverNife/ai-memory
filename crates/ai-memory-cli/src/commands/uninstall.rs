@@ -13,6 +13,7 @@ use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
+use ai_memory_core::routing_skills::{MANAGED_MARKER, MANAGED_SKILLS};
 use ai_memory_core::{MARKER_END, MARKER_START};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -41,6 +42,7 @@ enum DeleteKind {
     OpenClawPackageJson,
     OpenClawManifest,
     OpenClawEntrypoint,
+    ManagedSkill,
 }
 
 impl DeleteKind {
@@ -51,6 +53,7 @@ impl DeleteKind {
             Self::OpenClawPackageJson => "OpenClaw package manifest",
             Self::OpenClawManifest => "OpenClaw plugin manifest",
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
+            Self::ManagedSkill => "managed Agent Skill",
         }
     }
 }
@@ -232,7 +235,40 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         }
     }
 
+
+    // ---- Managed Agent Skills (project + global roots) ----
+    if want(crate::cli::UninstallOnly::Skills) {
+        let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
+        let home = dirs::home_dir();
+        for root in skill_roots(&cwd, home.as_deref()) {
+            for skill in MANAGED_SKILLS {
+                push_generated_delete(
+                    &mut plan,
+                    root.join(skill.relative_path),
+                    DeleteKind::ManagedSkill,
+                );
+            }
+        }
+    }
+
     Ok(plan)
+}
+
+fn skill_roots(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(4);
+    push_unique_skill_root(&mut roots, cwd.join(".claude").join("skills"));
+    push_unique_skill_root(&mut roots, cwd.join(".agents").join("skills"));
+    if let Some(home) = home {
+        push_unique_skill_root(&mut roots, home.join(".claude").join("skills"));
+        push_unique_skill_root(&mut roots, home.join(".agents").join("skills"));
+    }
+    roots
+}
+
+fn push_unique_skill_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if !roots.iter().any(|existing| existing == &root) {
+        roots.push(root);
+    }
 }
 
 /// Print the plan, one line per file, mirroring `reset`'s dry-run style.
@@ -276,6 +312,9 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
             }
             std::fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))?;
             println!("✓ deleted {}", path.display());
+            if *kind == DeleteKind::ManagedSkill {
+                remove_empty_skill_dirs(path)?;
+            }
         }
         PlannedChange::Rewrite { path, ops, .. } => {
             let outcome = apply_atomic(path, |existing| {
@@ -296,6 +335,36 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
             println!("✓ {} {}", outcome.verb(), path.display());
         }
     }
+    Ok(())
+}
+
+fn remove_empty_skill_dirs(skill_file: &Path) -> Result<()> {
+    let Some(skill_dir) = skill_file.parent() else {
+        return Ok(());
+    };
+    let root = skill_dir.parent().map(Path::to_path_buf);
+
+    remove_dir_if_empty(skill_dir)?;
+    if let Some(root) = root {
+        remove_dir_if_empty(&root)?;
+    }
+
+    Ok(())
+}
+
+fn remove_dir_if_empty(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+
+    let mut entries =
+        std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?;
+    if entries.next().is_some() {
+        return Ok(());
+    }
+
+    std::fs::remove_dir(path).with_context(|| format!("removing {}", path.display()))?;
+    println!("✓ removed empty directory {}", path.display());
     Ok(())
 }
 
@@ -577,6 +646,7 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                         .and_then(|additional| additional.as_bool())
                         == Some(false)
             }),
+        DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
     }
 }
 

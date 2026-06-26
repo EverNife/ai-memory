@@ -311,12 +311,13 @@ pub struct AuthLogoutArgs {
 #[derive(Debug, Args)]
 pub struct AuthStatusArgs {}
 
-/// Which concern `uninstall` should touch. Omitted = all three.
+/// Which concern `uninstall` should touch. Omitted = all four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum UninstallOnly {
     Hooks,
     Mcp,
     Instructions,
+    Skills,
 }
 
 /// Arguments for `uninstall`.
@@ -331,7 +332,7 @@ pub struct UninstallArgs {
     /// meaningful with `--apply`.
     #[arg(long)]
     pub purge_data: bool,
-    /// Limit to one concern. Omitted = hooks + mcp + instructions.
+    /// Limit to one concern. Omitted = hooks + mcp + instructions + skills.
     #[arg(long, value_enum)]
     pub only: Option<UninstallOnly>,
     /// Optional MCP server entry-name filter. Uninstall never matches by name
