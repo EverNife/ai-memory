@@ -106,12 +106,14 @@ pub enum Command {
     /// project that's been around for a while. Requires
     /// AI_MEMORY_LLM_PROVIDER configured on the server.
     Bootstrap(BootstrapArgs),
-    /// Install the ai-memory usage snippet into the project's
-    /// CLAUDE.md / AGENTS.md (or any markdown file you specify).
+    /// Install the ai-memory usage snippet and managed Agent Skills into the
+    /// project (or any markdown file / skill root you specify).
     /// Idempotent — bracketed by `<!-- ai-memory:start -->` /
     /// `<!-- ai-memory:end -->` markers so re-running replaces the
     /// block in place without duplicating.
     InstallInstructions(InstallInstructionsArgs),
+    /// Install core-managed ai-memory Agent Skills into agent skill directories.
+    InstallSkills(InstallSkillsArgs),
     /// Retro-fit existing sessions + observations to per-cwd projects
     /// based on the cwd captured at session-start. Pages are marked
     /// `is_latest=false` (they were a multi-project mash-up) so the
@@ -133,8 +135,8 @@ pub enum Command {
     /// copy+purge (only durable pages migrate, source purged). Either way the
     /// operation is irreversible — requires `--confirm`.
     MoveProject(MoveProjectArgs),
-    /// Remove ai-memory's wiring (hooks, MCP, instructions) from all
-    /// detected agents. Dry-run unless `--apply`.
+    /// Remove ai-memory's wiring (hooks, MCP, instructions, and default-root
+    /// managed skills) from all detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
     /// Manage optional upstream LLM provider authentication.
     Auth(AuthArgs),
@@ -309,12 +311,13 @@ pub struct AuthLogoutArgs {
 #[derive(Debug, Args)]
 pub struct AuthStatusArgs {}
 
-/// Which concern `uninstall` should touch. Omitted = all three.
+/// Which concern `uninstall` should touch. Omitted = all four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum UninstallOnly {
     Hooks,
     Mcp,
     Instructions,
+    Skills,
 }
 
 /// Arguments for `uninstall`.
@@ -329,7 +332,7 @@ pub struct UninstallArgs {
     /// meaningful with `--apply`.
     #[arg(long)]
     pub purge_data: bool,
-    /// Limit to one concern. Omitted = hooks + mcp + instructions.
+    /// Limit to one concern. Omitted = hooks + mcp + instructions + skills.
     #[arg(long, value_enum)]
     pub only: Option<UninstallOnly>,
     /// Optional MCP server entry-name filter. Uninstall never matches by name
@@ -432,13 +435,73 @@ pub struct InstallInstructionsArgs {
     /// to override the auto-detection.
     #[arg(long)]
     pub target: Option<PathBuf>,
-    /// Print the snippet to stdout instead of mutating the file.
+    /// Print the snippet to stdout instead of mutating files.
     /// The default IS mutation here (the print form is also
     /// available without this command — copy the block from the
     /// README). Pass `--print` to preview what would land in
-    /// the file.
+    /// the file. This does not print skill payloads; use
+    /// `install-skills --print` to preview managed Agent Skills.
     #[arg(long)]
     pub print: bool,
+    /// Skip installing/updating the managed ai-memory Agent Skills.
+    #[arg(long)]
+    pub no_skills: bool,
+    /// Scope for managed ai-memory skill installation.
+    #[arg(long = "skills-scope", value_enum)]
+    pub skills_scope: Option<InstallSkillsScope>,
+    /// Agent skill directory family for managed ai-memory skill installation.
+    #[arg(long = "skills-agent", value_enum)]
+    pub skills_agent: Option<InstallSkillsAgent>,
+    /// Override the managed skill root directory.
+    #[arg(long = "skills-target-dir")]
+    pub skills_target_dir: Option<PathBuf>,
+    /// Overwrite same-named unmanaged skills while installing from `install-instructions`.
+    #[arg(long = "skills-force")]
+    pub skills_force: bool,
+}
+
+/// Skill install scope for `install-skills`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallSkillsScope {
+    /// Install into this project's agent skill directories.
+    Project,
+    /// Install into the user's global agent skill directories.
+    Global,
+}
+
+/// Agent skill directory family for `install-skills`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallSkillsAgent {
+    /// Claude Code's `.claude/skills` directory.
+    ClaudeCode,
+    /// Cross-agent `.agents/skills` directory.
+    Agents,
+    /// Install into both Claude Code and `.agents` skill directories.
+    Both,
+}
+
+/// Arguments for `install-skills`.
+#[derive(Debug, Args)]
+pub struct InstallSkillsArgs {
+    /// Install project-local skills or global user skills.
+    #[arg(long, value_enum, default_value_t = InstallSkillsScope::Project)]
+    pub scope: InstallSkillsScope,
+    /// Which agent skill directory family to install into.
+    #[arg(long, value_enum, default_value_t = InstallSkillsAgent::ClaudeCode)]
+    pub agent: InstallSkillsAgent,
+    /// Override the skill root directory. When set, `--scope` and
+    /// `--agent` are ignored and the managed skill directories are
+    /// written below this root.
+    #[arg(long)]
+    pub target_dir: Option<PathBuf>,
+    /// Print target paths and SKILL.md contents without writing files.
+    #[arg(long)]
+    pub print: bool,
+    /// Overwrite same-named existing skills that do not contain the
+    /// ai-memory managed marker. Without this flag, unmanaged skills
+    /// are preserved and the command exits with an actionable error.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `bootstrap`.

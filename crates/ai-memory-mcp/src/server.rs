@@ -238,10 +238,14 @@ should be proposed from a completed session, or at explicit wrap-up \
   pages (idempotent, supports dry-run).\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
-  CLAUDE.md / AGENTS.md'. Returns the canonical routing snippet + \
-  filename hints; you then use your own Write/Edit tool to land it \
-  in the right rules file (Claude Code → CLAUDE.md, Codex / \
-  OpenCode / Cursor / Gemini → AGENTS.md).\n\
+  CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
+  slim markered snippet (`markered_block`), filename hints, \
+  `managed_skills` payloads, `target_hints` for `.claude/skills` or \
+  `.agents/skills`, and overwrite guidance. Use your own Write/Edit \
+  tool to replace only the ai-memory marker block in the rules file, \
+  then write each managed skill under the selected skill root. Only \
+  replace same-name skill files that contain the ai-memory managed \
+  marker unless the human explicitly forces replacement.\n\
 \n\
 **When the current project comes up empty, broaden — don't stop.** \
 `memory_query` searches only ONE project (the current one) by default. \
@@ -271,10 +275,12 @@ deployment, release, auth, scope, migration, PR-review, or \
 data-preservation work, search memory for the subsystem and task type \
 first.\n\
 \n\
-The routing snippet this very text comes from can also be installed \
-into the project's CLAUDE.md / AGENTS.md so the guidance survives \
-across sessions. From the agent: ask 'install ai-memory routing'. \
-From the terminal: `ai-memory install-instructions`.";
+The managed routing package this text points to can also be installed \
+into the project's CLAUDE.md / AGENTS.md plus ai-memory-managed Agent \
+Skills so the guidance survives across sessions. From the agent: ask \
+'install ai-memory routing' and use the returned `managed_skills` + \
+`target_hints`. From the terminal: `ai-memory install-instructions` \
+(or `ai-memory install-skills` to refresh only the skill files).";
 
 /// MCP server backed by the ai-memory store.
 #[derive(Clone)]
@@ -2135,22 +2141,35 @@ impl AiMemoryServer {
     /// agent can land it via its own Write/Edit tool. No server-side
     /// state changes — the server can't reach the agent's host
     /// filesystem.
-    #[tool(description = "Returns the canonical ai-memory routing snippet \
-        (the markdown block that tells the agent WHEN to call \
-        memory_query / memory_recent / memory_handoff_accept / etc.) \
-        plus filename hints per agent. Use when the user asks 'install \
-        ai-memory routing in this project' or 'add ai-memory to \
-        CLAUDE.md'. After calling, use your Write/Edit tool to: (a) \
-        pick the right rules file for yourself — Claude Code → \
-        CLAUDE.md, Codex / OpenCode / Cursor / Gemini CLI → AGENTS.md \
-        (or check `agent_filenames` in the response); (b) if the file \
-        already has a block bracketed by `<!-- ai-memory:start -->` / \
-        `<!-- ai-memory:end -->`, replace that block in place; \
-        otherwise append `markered_block` to the file with one blank \
-        line of separation. The block IS idempotent — re-runs replace \
-        in place. This tool is the source of truth for the snippet; \
-        do NOT improvise the routing table from memory.")]
+    #[tool(
+        description = "Returns the canonical ai-memory routing install payload: \
+        `markered_block` for the slim CLAUDE.md / AGENTS.md snippet, \
+        `agent_filenames` for rules-file targets, `managed_skills` for \
+        Agent Skill files, and `target_hints` for project/global \
+        `.claude/skills` and `.agents/skills` roots. Use when the user \
+        asks to install or refresh ai-memory routing in this project. \
+        After calling, use your Write/Edit tool to preserve non-ai-memory \
+        user content: replace only an existing `<!-- ai-memory:start -->` \
+        / `<!-- ai-memory:end -->` block or append `markered_block` with \
+        one blank line, then write every `managed_skills` item beneath \
+        the chosen skill root using its `relative_path`. This tool is \
+        read-only and is the source of truth for the snippet and skills. \
+        Skill files are ai-memory-managed only when they contain the \
+        managed marker; do not overwrite unmanaged same-name skills unless \
+        the human explicitly forces replacement."
+    )]
     async fn memory_install_self_routing(&self) -> Result<CallToolResult, McpError> {
+        let managed_skills: Vec<_> = ai_memory_core::routing_skills::MANAGED_SKILLS
+            .iter()
+            .map(|skill| {
+                serde_json::json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "relative_path": skill.relative_path,
+                    "content": skill.content,
+                })
+            })
+            .collect();
         let response = serde_json::json!({
             "markered_block": ai_memory_core::full_block(),
             "marker_start": ai_memory_core::MARKER_START,
@@ -2164,11 +2183,29 @@ impl AiMemoryServer {
                 "antigravity_cli": "AGENTS.md",
                 "default": "AGENTS.md"
             },
+            "managed_skills": managed_skills,
+            "target_hints": {
+                "project": {
+                    "claude_code": ".claude/skills",
+                    "agents": ".agents/skills"
+                },
+                "global": {
+                    "claude_code": "~/.claude/skills",
+                    "agents": "~/.agents/skills"
+                }
+            },
+            "overwrite_guidance": {
+                "managed_marker": ai_memory_core::routing_skills::MANAGED_MARKER,
+                "safe_update": "Existing same-name skill files containing the managed marker may be replaced with the managed payload.",
+                "unsafe_update": "Unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
+            },
             "notes": [
                 "Pick the filename matching your own agent identity.",
                 "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end -->, replace ONLY that block in place; preserve every other line.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
-                "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content."
+                "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
+                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path> or .agents/skills/<relative_path>.",
+                "Existing skill files containing the managed marker <!-- ai-memory-managed: routing-skill --> may be replaced; unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
             ]
         });
         ok_json(&response)
@@ -2370,6 +2407,8 @@ fn test_parts_default() -> axum::http::request::Parts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use ai_memory_core::{
         ActorContext, AuthLevel, NewObservation, NewPage, NewSession, NewUser, ObservationKind,
         PagePath, Tier,
@@ -2411,6 +2450,78 @@ mod tests {
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
         (tmp, store, server, ws, proj)
     }
+
+    fn installed_ai_memory_prompt_surface() -> String {
+        let mut prompt = String::from(ai_memory_core::SNIPPET_BODY);
+        for skill in ai_memory_core::routing_skills::MANAGED_SKILLS {
+            prompt.push_str("\n\n");
+            prompt.push_str(skill.content);
+        }
+        prompt
+    }
+
+    fn combined_ai_memory_prompt_surface() -> String {
+        let mut prompt = String::from(MEMORY_INSTRUCTIONS);
+        prompt.push_str("\n\n");
+        prompt.push_str(&installed_ai_memory_prompt_surface());
+        prompt
+    }
+
+    fn assert_detailed_prompt_surfaces(mut assert_prompt: impl FnMut(&str, &str)) {
+        assert_prompt("MCP handshake instructions", MEMORY_INSTRUCTIONS);
+        let combined = combined_ai_memory_prompt_surface();
+        assert_prompt(
+            "combined MCP, snippet, and managed skill prompts",
+            &combined,
+        );
+    }
+
+    fn call_tool_json(result: CallToolResult) -> serde_json::Value {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or_else(|| panic!("expected text content"));
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("invalid JSON response: {e}\n{text}"))
+    }
+
+    const MCP_TOOL_NAMES: &[&str] = &[
+        "memory_query",
+        "memory_recent",
+        "memory_status",
+        "memory_briefing",
+        "memory_explore",
+        "memory_handoff_accept",
+        "memory_handoff_begin",
+        "memory_handoff_cancel",
+        "memory_consolidate",
+        "memory_auto_improve",
+        "memory_write_page",
+        "memory_read_page",
+        "memory_delete_page",
+        "memory_lint",
+        "memory_forget_sweep",
+        "memory_install_self_routing",
+    ];
+
+    const DETAILED_ROUTING_TOOL_NAMES: &[&str] = &[
+        "memory_query",
+        "memory_recent",
+        "memory_status",
+        "memory_briefing",
+        "memory_explore",
+        "memory_handoff_accept",
+        "memory_handoff_begin",
+        "memory_handoff_cancel",
+        "memory_consolidate",
+        "memory_auto_improve",
+        "memory_write_page",
+        "memory_read_page",
+        "memory_delete_page",
+        "memory_lint",
+        "memory_forget_sweep",
+    ];
 
     #[test]
     fn actor_key_uses_memory_session_header() {
@@ -2468,46 +2579,108 @@ mod tests {
         let (_tmp, _store, _server, _ws, _pj) = setup_server().await;
     }
 
-    #[test]
-    fn prompts_cover_every_mcp_tool() {
-        let tools = [
-            "memory_query",
-            "memory_recent",
-            "memory_status",
-            "memory_briefing",
-            "memory_explore",
-            "memory_handoff_accept",
-            "memory_handoff_begin",
-            "memory_handoff_cancel",
-            "memory_consolidate",
-            "memory_auto_improve",
-            "memory_write_page",
-            "memory_read_page",
-            "memory_delete_page",
-            "memory_lint",
-            "memory_forget_sweep",
-            "memory_install_self_routing",
-        ];
-        let routing = ai_memory_core::full_block();
-        for tool in tools {
+    #[tokio::test]
+    async fn prompts_cover_every_registered_mcp_tool() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let actual_tools: BTreeSet<String> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        let expected_tools: BTreeSet<String> = MCP_TOOL_NAMES
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect();
+        assert_eq!(
+            actual_tools, expected_tools,
+            "MCP_TOOL_NAMES must match the registered tool router set"
+        );
+
+        for tool in &actual_tools {
             assert!(
-                MEMORY_INSTRUCTIONS.contains(tool),
+                MEMORY_INSTRUCTIONS.contains(tool.as_str()),
                 "MCP handshake instructions omit {tool}"
             );
+        }
+
+        let installed = installed_ai_memory_prompt_surface();
+        for tool in &actual_tools {
             assert!(
-                routing.contains(tool),
-                "routing snippet omit {tool}; update ai_memory_core::SNIPPET_BODY"
+                installed.contains(tool.as_str()),
+                "installed snippet and managed skills omit {tool}"
             );
         }
     }
 
     #[test]
+    fn snippet_keeps_always_loaded_invariants() {
+        let snippet = ai_memory_core::SNIPPET_BODY;
+        assert!(snippet.contains("Long-term memory (ai-memory)"));
+        assert!(snippet.contains("Default to the current project"));
+        assert!(
+            snippet.contains("Do NOT pass `project`, `workspace`, or `cwd`"),
+            "snippet must preserve current-project scope defaulting"
+        );
+        assert!(
+            snippet.contains("Lifecycle hooks already capture"),
+            "snippet must keep automatic lifecycle capture guidance"
+        );
+        assert!(
+            snippet.contains("durable")
+                && snippet.contains("explicitly asks")
+                && (snippet.contains("permanent") || snippet.contains("permanently")),
+            "snippet must say durable writes require an explicit user request"
+        );
+        assert!(
+            snippet.contains("Agent Skills") && snippet.contains("installed"),
+            "snippet must route detailed guidance through installed Agent Skills"
+        );
+        assert!(
+            snippet.contains("canonical agent instruction file"),
+            "snippet must keep canonical project-rule placement guidance"
+        );
+        assert!(
+            snippet.contains("memory_install_self_routing")
+                && snippet.contains("ai-memory install-instructions"),
+            "snippet must preserve refresh/install guidance"
+        );
+        let refresh_guidance = snippet
+            .split("### Refreshing this snippet")
+            .nth(1)
+            .expect("snippet must keep refresh guidance");
+        assert!(
+            refresh_guidance.contains("managed_skills")
+                && refresh_guidance.contains("target_hints")
+                && refresh_guidance.contains("relative_path"),
+            "snippet must tell agents to refresh managed skill files"
+        );
+        assert!(
+            snippet.contains(ai_memory_core::MARKER_START)
+                && snippet.contains(ai_memory_core::MARKER_END),
+            "snippet must preserve marker replacement guidance"
+        );
+    }
+
+    #[test]
+    fn snippet_omits_detailed_tool_routing_table() {
+        let snippet = ai_memory_core::SNIPPET_BODY;
+        assert!(!snippet.contains("### When to reach for each tool"));
+        assert!(!snippet.contains("| User says / situation | Tool |"));
+        for tool in DETAILED_ROUTING_TOOL_NAMES {
+            assert!(
+                !snippet.contains(tool),
+                "slim snippet must leave detailed {tool} routing to managed skills"
+            );
+        }
+    }
+    #[test]
     fn prompts_separate_briefing_from_handoff_lifecycle() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             let lower = prompt.to_ascii_lowercase();
             assert!(
                 prompt.contains("memory_briefing") && lower.contains("read-only"),
-                "briefing guidance must say it is read-only"
+                "{label} must say briefing is read-only"
             );
             assert!(
                 prompt.contains("memory_handoff_begin")
@@ -2516,15 +2689,14 @@ mod tests {
                     && (lower.contains("do not use") || lower.contains("do **not** use"))
                     && lower.contains("status")
                     && lower.contains("briefing"),
-                "handoff-begin guidance must be session-end only and reject status/briefing use"
+                "{label} must make handoff-begin session-end only and reject status/briefing use"
             );
             assert!(
                 prompt.contains("memory_handoff_cancel") && prompt.contains("handoff_id"),
-                "cancel guidance must expose exact-id cleanup for mistaken handoffs"
+                "{label} must expose exact-id cleanup for mistaken handoffs"
             );
-        }
+        });
     }
-
     #[test]
     fn prompts_teach_cross_project_search_strategy() {
         // Regression: a single-project miss must not read as "never recorded".
@@ -2534,22 +2706,22 @@ mod tests {
         // legacy "no global mode" phrasing that briefly shipped in #56.
         // (Learned the hard way when cluster-access info lived in a sibling
         // `infra` project.)
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("scopes"),
-                "prompt must teach broadening via `scopes`"
+                "{label} must teach broadening via `scopes`"
             );
             assert!(
                 prompt.contains("global=true") || prompt.contains("global = true"),
-                "prompt must also teach broadening via `global=true`"
+                "{label} must also teach broadening via `global=true`"
             );
             assert!(
                 prompt.contains("sibling") || prompt.contains("SIBLING"),
-                "prompt must mention knowledge can live in a sibling project"
+                "{label} must mention knowledge can live in a sibling project"
             );
             assert!(
                 prompt.contains("snippet") || prompt.contains("SNIPPET"),
-                "prompt must warn that query returns snippets, not full bodies"
+                "{label} must warn that query returns snippets, not full bodies"
             );
             // Guard against the contradiction: standalone prose must not say
             // a global mode doesn't exist when the bullet/table-row above it
@@ -2563,72 +2735,205 @@ mod tests {
             for phrase in no_global_phrases {
                 assert!(
                     !prompt.contains(phrase),
-                    "prompt must not contain the contradictory phrase {phrase:?}"
+                    "{label} must not contain the contradictory phrase {phrase:?}"
                 );
             }
-        }
+        });
+        let installed = installed_ai_memory_prompt_surface();
+        assert!(
+            installed.contains("scopes") && installed.contains("global=true"),
+            "installed prompt surface must include exact cross-project broadening args"
+        );
+        assert!(
+            installed.contains("deployment")
+                && installed.contains("PR review")
+                && installed.contains("migration")
+                && installed.contains("data-preservation"),
+            "installed prompt surface must preserve high-risk retrieval preflight guidance"
+        );
     }
 
     #[test]
     fn prompts_route_permanent_annotations_to_write_page_not_handoff() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("permanent") || prompt.contains("permanently"),
-                "prompt must mention permanent memory use cases"
+                "{label} must mention permanent memory use cases"
             );
             assert!(
                 prompt.contains("memory_write_page"),
-                "prompt must expose memory_write_page"
+                "{label} must expose memory_write_page"
             );
             assert!(
                 prompt.contains("do NOT use") || prompt.contains("do **not** use"),
-                "prompt must explicitly disallow handoffs for permanent notes"
+                "{label} must explicitly disallow handoffs for permanent notes"
             );
-        }
+        });
     }
-
     #[test]
     fn prompts_treat_retrieved_memory_as_actionable_guidance() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             let lower = prompt.to_ascii_lowercase();
             assert!(
                 prompt.contains("_rules/")
                     && prompt.contains("gotchas/")
                     && prompt.contains("procedures/")
                     && prompt.contains("decisions/"),
-                "prompt must name actionable page families"
+                "{label} must name actionable page families"
             );
             assert!(
                 lower.contains("constraints")
                     && lower.contains("preflight")
                     && lower.contains("checklists"),
-                "prompt must teach how to use rules/gotchas/procedures"
+                "{label} must teach how to use rules/gotchas/procedures"
             );
             assert!(
                 lower.contains("before non-trivial")
                     && lower.contains("auth")
                     && lower.contains("migration"),
-                "prompt must make proactive retrieval the default for risky work"
+                "{label} must make proactive retrieval the default for risky work"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn memory_install_self_routing_response_includes_managed_skills_and_targets() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+
+        let response = call_tool_json(server.memory_install_self_routing().await.unwrap());
+
+        assert_eq!(
+            response["markered_block"].as_str().unwrap(),
+            ai_memory_core::full_block()
+        );
+        assert_eq!(
+            response["marker_start"].as_str().unwrap(),
+            ai_memory_core::MARKER_START
+        );
+        assert_eq!(
+            response["marker_end"].as_str().unwrap(),
+            ai_memory_core::MARKER_END
+        );
+        assert_eq!(
+            response["agent_filenames"]["claude_code"].as_str().unwrap(),
+            "CLAUDE.md"
+        );
+        assert_eq!(
+            response["agent_filenames"]["default"].as_str().unwrap(),
+            "AGENTS.md"
+        );
+
+        let managed_skills = response["managed_skills"]
+            .as_array()
+            .expect("managed_skills must be an array");
+        assert_eq!(
+            managed_skills.len(),
+            ai_memory_core::routing_skills::MANAGED_SKILLS.len()
+        );
+        for expected in ai_memory_core::routing_skills::MANAGED_SKILLS {
+            let skill = managed_skills
+                .iter()
+                .find(|skill| skill["name"].as_str() == Some(expected.name))
+                .unwrap_or_else(|| panic!("missing managed skill {}", expected.name));
+            assert_eq!(skill["description"].as_str().unwrap(), expected.description);
+            assert_eq!(
+                skill["relative_path"].as_str().unwrap(),
+                expected.relative_path
+            );
+            assert_eq!(skill["content"].as_str().unwrap(), expected.content);
+            assert!(
+                skill["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains(ai_memory_core::routing_skills::MANAGED_MARKER),
+                "managed skill {} must include the ownership marker",
+                expected.name
             );
         }
+
+        assert_eq!(
+            response["target_hints"]["project"]["claude_code"]
+                .as_str()
+                .unwrap(),
+            ".claude/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["project"]["agents"]
+                .as_str()
+                .unwrap(),
+            ".agents/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["claude_code"]
+                .as_str()
+                .unwrap(),
+            "~/.claude/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["agents"]
+                .as_str()
+                .unwrap(),
+            "~/.agents/skills"
+        );
+
+        let notes = response["notes"]
+            .as_array()
+            .expect("notes must remain an array")
+            .iter()
+            .map(|note| note.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(notes.contains(ai_memory_core::routing_skills::MANAGED_MARKER));
+        assert!(notes.contains("unmanaged same-name skills"));
+        assert!(notes.contains("explicitly forces replacement"));
+    }
+
+    #[tokio::test]
+    async fn memory_install_self_routing_tool_description_covers_snippet_and_skills() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let install = tools
+            .iter()
+            .find(|tool| tool.name == "memory_install_self_routing")
+            .expect("memory_install_self_routing must be registered");
+        let desc = install
+            .description
+            .as_deref()
+            .expect("memory_install_self_routing must carry a description");
+
+        assert!(
+            desc.contains("markered_block") && desc.contains("managed_skills"),
+            "tool description must tell agents to install snippet and skill payloads; got: {desc}"
+        );
+        assert!(
+            desc.contains(".claude/skills") && desc.contains(".agents/skills"),
+            "tool description must name Claude and .agents skill targets; got: {desc}"
+        );
+        assert!(
+            desc.contains("preserve non-ai-memory user content"),
+            "tool description must preserve user content; got: {desc}"
+        );
+        assert!(
+            desc.contains("unmanaged same-name skills") && desc.contains("explicitly forces"),
+            "tool description must mention safe overwrite behavior; got: {desc}"
+        );
     }
 
     #[tokio::test]
     async fn prompts_expose_auto_improve_as_auto_approval_with_manual_opt_in() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             let lower = prompt.to_ascii_lowercase();
             assert!(prompt.contains("memory_auto_improve"));
             assert!(
                 lower.contains("applies validated")
                     || (lower.contains("approval") && lower.contains("path")),
-                "prompt must state auto-improve applies through the approval path"
+                "{label} must state auto-improve applies through the approval path"
             );
             assert!(
                 lower.contains("require_approval") && lower.contains("pending-writes"),
-                "prompt must describe the manual review opt-in"
+                "{label} must describe the manual review opt-in"
             );
-        }
-
+        });
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let tools = server.tool_router.list_all();
         let auto_improve = tools
@@ -2645,23 +2950,23 @@ mod tests {
 
     #[test]
     fn prompts_teach_cross_workspace_handoff_scope() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("memory_handoff_begin") && prompt.contains("memory_handoff_accept"),
-                "prompt must include handoff lifecycle tools"
+                "{label} must include handoff lifecycle tools"
             );
             assert!(
                 prompt.contains("workspace") && prompt.contains("project"),
-                "handoff prompt guidance must mention workspace+project scoping"
+                "{label} handoff guidance must mention workspace+project scoping"
             );
             assert!(
                 prompt.contains("sibling")
                     && (prompt.contains("workspace/project")
                         || prompt.contains("workspace + project")
                         || prompt.contains("workspace` + `project")),
-                "handoff prompt guidance must restrict explicit workspace scope to named siblings"
+                "{label} handoff guidance must restrict explicit workspace scope to named siblings"
             );
-        }
+        });
     }
 
     /// All three prompt surfaces must steer agents toward the H1-in-body
@@ -2670,22 +2975,22 @@ mod tests {
     /// fails to escape quotes (issue #67); routing every "remember this"
     /// call through the H1 path avoids the footgun entirely.
     ///
-    /// The three surfaces — `MEMORY_INSTRUCTIONS`, the routing snippet
-    /// (`SNIPPET_BODY`), and the per-tool `#[tool(description=...)]`
-    /// string surfaced via `tools/list` — are independent and must be
-    /// kept aligned per the CLAUDE.md "MCP tool surface changes" rule.
+    /// The three surfaces - `MEMORY_INSTRUCTIONS`, the installed routing
+    /// surface (`SNIPPET_BODY` plus managed skills), and the per-tool
+    /// `#[tool(description=...)]` string surfaced via `tools/list` - are
+    /// independent and must stay aligned.
     #[tokio::test]
     async fn prompts_steer_write_page_toward_h1_title_convention() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("H1"),
-                "prompt must mention the H1 title convention for memory_write_page"
+                "{label} must mention the H1 title convention for memory_write_page"
             );
             assert!(
                 prompt.contains("omit") || prompt.contains("Omit"),
-                "prompt must tell the agent to omit the `title` argument"
+                "{label} must tell the agent to omit the `title` argument"
             );
-        }
+        });
         // The third surface: the rmcp tool description sent to clients
         // via `tools/list`. Spell-checked against the same keywords so
         // that a future edit cannot silently drop the guidance from the

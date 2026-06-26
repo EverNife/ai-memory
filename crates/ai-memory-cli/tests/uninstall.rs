@@ -1,8 +1,11 @@
 //! End-to-end: install hooks into a temp HOME, then uninstall, and
 //! assert the file round-trips (our entries gone, third-party intact).
 
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
+
+use ai_memory_core::routing_skills::{MANAGED_MARKER, MANAGED_SKILLS};
 
 static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -12,6 +15,30 @@ fn cli_test_lock() -> MutexGuard<'static, ()> {
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-memory")
+}
+
+fn run_uninstall(project: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .current_dir(project)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
+        .output()
+        .unwrap()
+}
+
+fn write_file(path: &Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+fn managed_skill_content() -> String {
+    format!(
+        "---\nname: test\n---\n{}\nmanaged test skill\n",
+        MANAGED_MARKER
+    )
 }
 
 #[test]
@@ -399,6 +426,216 @@ fn uninstall_dry_run_changes_nothing() {
 
     let after = std::fs::read_to_string(claude.join("settings.json")).unwrap();
     assert_eq!(after, original, "dry-run must not modify the file");
+}
+
+#[test]
+fn default_uninstall_removes_managed_skills_across_roots_and_preserves_user_content() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let managed_content = managed_skill_content();
+
+    let project_claude = project.path().join(".claude/skills");
+    let project_agents = project.path().join(".agents/skills");
+    let global_claude = home.path().join(".claude/skills");
+    let global_agents = home.path().join(".agents/skills");
+
+    let managed_paths = [
+        project_claude.join(MANAGED_SKILLS[0].relative_path),
+        project_agents.join(MANAGED_SKILLS[2].relative_path),
+        global_claude.join(MANAGED_SKILLS[3].relative_path),
+        global_agents.join(MANAGED_SKILLS[4].relative_path),
+    ];
+    for path in &managed_paths {
+        write_file(path, &managed_content);
+    }
+
+    let unmanaged_same_name = project_claude.join(MANAGED_SKILLS[1].relative_path);
+    let unmanaged_content = "---\nname: ai-memory-handoff\n---\nuser-owned same-name skill\n";
+    write_file(&unmanaged_same_name, unmanaged_content);
+
+    let unrelated_sibling = project_claude.join("user-skill/SKILL.md");
+    write_file(&unrelated_sibling, "---\nname: user-skill\n---\nkeep me\n");
+
+    let extra_file_in_managed_dir = managed_paths[1].parent().unwrap().join("notes.txt");
+    write_file(&extra_file_in_managed_dir, "keep this sibling file\n");
+
+    let output = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--apply", "--yes"],
+    );
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for path in &managed_paths {
+        assert!(
+            !path.exists(),
+            "managed skill file should be removed: {path:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&unmanaged_same_name).unwrap(),
+        unmanaged_content,
+        "unmanaged same-name skill must be preserved"
+    );
+    assert!(
+        unrelated_sibling.exists(),
+        "unrelated sibling skill survives"
+    );
+    assert!(
+        extra_file_in_managed_dir.exists(),
+        "non-empty managed skill directory must not be removed"
+    );
+    assert!(
+        !managed_paths[0].parent().unwrap().exists(),
+        "empty managed skill directory should be removed"
+    );
+    assert!(
+        !global_claude.exists() && !global_agents.exists(),
+        "empty global skill roots should be removed"
+    );
+}
+
+#[test]
+fn install_skills_then_uninstall_only_skills_round_trips() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let install = Command::new(bin())
+        .args(["install-skills", "--scope", "project", "--agent", "both"])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    for root in [
+        project.path().join(".claude/skills"),
+        project.path().join(".agents/skills"),
+    ] {
+        for skill in MANAGED_SKILLS {
+            assert!(root.join(skill.relative_path).exists());
+        }
+    }
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    assert!(
+        !project.path().join(".claude/skills").exists(),
+        "empty Claude skills root should be removed"
+    );
+    assert!(
+        !project.path().join(".agents/skills").exists(),
+        "empty .agents skills root should be removed"
+    );
+}
+
+#[test]
+fn uninstall_only_skills_leaves_custom_target_dir_for_manual_cleanup() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let custom_root = project.path().join("custom-skills");
+
+    let install = Command::new(bin())
+        .args([
+            "install-skills",
+            "--target-dir",
+            custom_root.to_str().unwrap(),
+        ])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let custom_skill = custom_root.join(MANAGED_SKILLS[0].relative_path);
+    assert!(custom_skill.exists());
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    assert!(
+        custom_skill.exists(),
+        "custom --target-dir skill roots are intentionally left for manual cleanup"
+    );
+    assert!(!project.path().join(".claude/skills").exists());
+    assert!(!project.path().join(".agents/skills").exists());
+}
+
+#[test]
+fn uninstall_skills_dry_run_reports_plan_without_mutating() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let skill_path = project
+        .path()
+        .join(".claude/skills")
+        .join(MANAGED_SKILLS[0].relative_path);
+    let original = managed_skill_content();
+    write_file(&skill_path, &original);
+
+    let output = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills"],
+    );
+    assert!(
+        output.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("would delete"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("managed Agent Skill"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains(&skill_path.display().to_string()),
+        "stdout was: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&skill_path).unwrap(),
+        original,
+        "dry-run must not remove or rewrite managed skill"
+    );
 }
 
 #[test]

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `install-instructions` now refreshes a slim markered CLAUDE.md/AGENTS.md
+  snippet and installs or updates managed ai-memory Agent Skills by default,
+  with `--no-skills` for snippet-only refreshes and `--skills-*` flags for
+  scope, agent family, target root, and forced unmanaged replacement. Added
+  `install-skills` for refreshing those prompt-packaging skills directly, and
+  `memory_install_self_routing` now returns the slim block, managed skill
+  payloads, target hints, and overwrite guidance for agents that install
+  routing through MCP.
+
 ### Added
 - The native `session-end` hook now emits a one-line stderr note when the spool
   drain leaves events queued for a later boundary: it reports how many events
@@ -15,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`AI_MEMORY_HOOK_END_BUDGET_MINUTES`, `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD`),
   turning an otherwise silent, scary cancelled-hook symptom into an actionable,
   self-documenting message. A fully-drained session stays silent. (#130)
+- `ai-memory uninstall --only skills` now removes ai-memory-managed Agent Skill
+  files from the default project/global `.claude/skills` and `.agents/skills`
+  roots after marker validation; custom `--target-dir` skill roots remain a
+  manual cleanup path.
 
 ## [1.3.0] - 2026-06-24
 
