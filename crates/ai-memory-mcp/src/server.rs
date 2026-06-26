@@ -2412,6 +2412,65 @@ mod tests {
         (tmp, store, server, ws, proj)
     }
 
+    fn installed_ai_memory_prompt_surface() -> String {
+        let mut prompt = String::from(ai_memory_core::SNIPPET_BODY);
+        for skill in ai_memory_core::routing_skills::MANAGED_SKILLS {
+            prompt.push_str("\n\n");
+            prompt.push_str(skill.content);
+        }
+        prompt
+    }
+
+    fn combined_ai_memory_prompt_surface() -> String {
+        let mut prompt = String::from(MEMORY_INSTRUCTIONS);
+        prompt.push_str("\n\n");
+        prompt.push_str(&installed_ai_memory_prompt_surface());
+        prompt
+    }
+
+    fn assert_detailed_prompt_surfaces(mut assert_prompt: impl FnMut(&str, &str)) {
+        assert_prompt("MCP handshake instructions", MEMORY_INSTRUCTIONS);
+        let combined = combined_ai_memory_prompt_surface();
+        assert_prompt("combined MCP, snippet, and managed skill prompts", &combined);
+    }
+
+    const MCP_TOOL_NAMES: &[&str] = &[
+        "memory_query",
+        "memory_recent",
+        "memory_status",
+        "memory_briefing",
+        "memory_explore",
+        "memory_handoff_accept",
+        "memory_handoff_begin",
+        "memory_handoff_cancel",
+        "memory_consolidate",
+        "memory_auto_improve",
+        "memory_write_page",
+        "memory_read_page",
+        "memory_delete_page",
+        "memory_lint",
+        "memory_forget_sweep",
+        "memory_install_self_routing",
+    ];
+
+    const DETAILED_ROUTING_TOOL_NAMES: &[&str] = &[
+        "memory_query",
+        "memory_recent",
+        "memory_status",
+        "memory_briefing",
+        "memory_explore",
+        "memory_handoff_accept",
+        "memory_handoff_begin",
+        "memory_handoff_cancel",
+        "memory_consolidate",
+        "memory_auto_improve",
+        "memory_write_page",
+        "memory_read_page",
+        "memory_delete_page",
+        "memory_lint",
+        "memory_forget_sweep",
+    ];
+
     #[test]
     fn actor_key_uses_memory_session_header() {
         let mut parts = test_parts_default();
@@ -2470,44 +2529,80 @@ mod tests {
 
     #[test]
     fn prompts_cover_every_mcp_tool() {
-        let tools = [
-            "memory_query",
-            "memory_recent",
-            "memory_status",
-            "memory_briefing",
-            "memory_explore",
-            "memory_handoff_accept",
-            "memory_handoff_begin",
-            "memory_handoff_cancel",
-            "memory_consolidate",
-            "memory_auto_improve",
-            "memory_write_page",
-            "memory_read_page",
-            "memory_delete_page",
-            "memory_lint",
-            "memory_forget_sweep",
-            "memory_install_self_routing",
-        ];
-        let routing = ai_memory_core::full_block();
-        for tool in tools {
+        for tool in MCP_TOOL_NAMES {
             assert!(
                 MEMORY_INSTRUCTIONS.contains(tool),
                 "MCP handshake instructions omit {tool}"
             );
+        }
+
+        let installed = installed_ai_memory_prompt_surface();
+        for tool in MCP_TOOL_NAMES {
             assert!(
-                routing.contains(tool),
-                "routing snippet omit {tool}; update ai_memory_core::SNIPPET_BODY"
+                installed.contains(tool),
+                "installed snippet and managed skills omit {tool}"
             );
         }
     }
 
     #[test]
+    fn snippet_keeps_always_loaded_invariants() {
+        let snippet = ai_memory_core::SNIPPET_BODY;
+        assert!(snippet.contains("Long-term memory (ai-memory)"));
+        assert!(snippet.contains("Default to the current project"));
+        assert!(
+            snippet.contains("Do NOT pass `project`, `workspace`, or `cwd`"),
+            "snippet must preserve current-project scope defaulting"
+        );
+        assert!(
+            snippet.contains("Lifecycle hooks already capture"),
+            "snippet must keep automatic lifecycle capture guidance"
+        );
+        assert!(
+            snippet.contains("durable")
+                && snippet.contains("explicitly asks")
+                && (snippet.contains("permanent") || snippet.contains("permanently")),
+            "snippet must say durable writes require an explicit user request"
+        );
+        assert!(
+            snippet.contains("Agent Skills") && snippet.contains("installed"),
+            "snippet must route detailed guidance through installed Agent Skills"
+        );
+        assert!(
+            snippet.contains("canonical agent instruction file"),
+            "snippet must keep canonical project-rule placement guidance"
+        );
+        assert!(
+            snippet.contains("memory_install_self_routing")
+                && snippet.contains("ai-memory install-instructions"),
+            "snippet must preserve refresh/install guidance"
+        );
+        assert!(
+            snippet.contains(ai_memory_core::MARKER_START)
+                && snippet.contains(ai_memory_core::MARKER_END),
+            "snippet must preserve marker replacement guidance"
+        );
+    }
+
+    #[test]
+    fn snippet_omits_detailed_tool_routing_table() {
+        let snippet = ai_memory_core::SNIPPET_BODY;
+        assert!(!snippet.contains("### When to reach for each tool"));
+        assert!(!snippet.contains("| User says / situation | Tool |"));
+        for tool in DETAILED_ROUTING_TOOL_NAMES {
+            assert!(
+                !snippet.contains(tool),
+                "slim snippet must leave detailed {tool} routing to managed skills"
+            );
+        }
+    }
+    #[test]
     fn prompts_separate_briefing_from_handoff_lifecycle() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             let lower = prompt.to_ascii_lowercase();
             assert!(
                 prompt.contains("memory_briefing") && lower.contains("read-only"),
-                "briefing guidance must say it is read-only"
+                "{label} must say briefing is read-only"
             );
             assert!(
                 prompt.contains("memory_handoff_begin")
@@ -2516,15 +2611,14 @@ mod tests {
                     && (lower.contains("do not use") || lower.contains("do **not** use"))
                     && lower.contains("status")
                     && lower.contains("briefing"),
-                "handoff-begin guidance must be session-end only and reject status/briefing use"
+                "{label} must make handoff-begin session-end only and reject status/briefing use"
             );
             assert!(
                 prompt.contains("memory_handoff_cancel") && prompt.contains("handoff_id"),
-                "cancel guidance must expose exact-id cleanup for mistaken handoffs"
+                "{label} must expose exact-id cleanup for mistaken handoffs"
             );
-        }
+        });
     }
-
     #[test]
     fn prompts_teach_cross_project_search_strategy() {
         // Regression: a single-project miss must not read as "never recorded".
@@ -2534,22 +2628,22 @@ mod tests {
         // legacy "no global mode" phrasing that briefly shipped in #56.
         // (Learned the hard way when cluster-access info lived in a sibling
         // `infra` project.)
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("scopes"),
-                "prompt must teach broadening via `scopes`"
+                "{label} must teach broadening via `scopes`"
             );
             assert!(
                 prompt.contains("global=true") || prompt.contains("global = true"),
-                "prompt must also teach broadening via `global=true`"
+                "{label} must also teach broadening via `global=true`"
             );
             assert!(
                 prompt.contains("sibling") || prompt.contains("SIBLING"),
-                "prompt must mention knowledge can live in a sibling project"
+                "{label} must mention knowledge can live in a sibling project"
             );
             assert!(
                 prompt.contains("snippet") || prompt.contains("SNIPPET"),
-                "prompt must warn that query returns snippets, not full bodies"
+                "{label} must warn that query returns snippets, not full bodies"
             );
             // Guard against the contradiction: standalone prose must not say
             // a global mode doesn't exist when the bullet/table-row above it
@@ -2563,72 +2657,70 @@ mod tests {
             for phrase in no_global_phrases {
                 assert!(
                     !prompt.contains(phrase),
-                    "prompt must not contain the contradictory phrase {phrase:?}"
+                    "{label} must not contain the contradictory phrase {phrase:?}"
                 );
             }
-        }
+        });
     }
+
 
     #[test]
     fn prompts_route_permanent_annotations_to_write_page_not_handoff() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("permanent") || prompt.contains("permanently"),
-                "prompt must mention permanent memory use cases"
+                "{label} must mention permanent memory use cases"
             );
             assert!(
                 prompt.contains("memory_write_page"),
-                "prompt must expose memory_write_page"
+                "{label} must expose memory_write_page"
             );
             assert!(
                 prompt.contains("do NOT use") || prompt.contains("do **not** use"),
-                "prompt must explicitly disallow handoffs for permanent notes"
+                "{label} must explicitly disallow handoffs for permanent notes"
             );
-        }
+        });
     }
-
     #[test]
     fn prompts_treat_retrieved_memory_as_actionable_guidance() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             let lower = prompt.to_ascii_lowercase();
             assert!(
                 prompt.contains("_rules/")
                     && prompt.contains("gotchas/")
                     && prompt.contains("procedures/")
                     && prompt.contains("decisions/"),
-                "prompt must name actionable page families"
+                "{label} must name actionable page families"
             );
             assert!(
                 lower.contains("constraints")
                     && lower.contains("preflight")
                     && lower.contains("checklists"),
-                "prompt must teach how to use rules/gotchas/procedures"
+                "{label} must teach how to use rules/gotchas/procedures"
             );
             assert!(
                 lower.contains("before non-trivial")
                     && lower.contains("auth")
                     && lower.contains("migration"),
-                "prompt must make proactive retrieval the default for risky work"
+                "{label} must make proactive retrieval the default for risky work"
             );
-        }
+        });
     }
-
     #[tokio::test]
     async fn prompts_expose_auto_improve_as_auto_approval_with_manual_opt_in() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             let lower = prompt.to_ascii_lowercase();
             assert!(prompt.contains("memory_auto_improve"));
             assert!(
                 lower.contains("applies validated")
                     || (lower.contains("approval") && lower.contains("path")),
-                "prompt must state auto-improve applies through the approval path"
+                "{label} must state auto-improve applies through the approval path"
             );
             assert!(
                 lower.contains("require_approval") && lower.contains("pending-writes"),
-                "prompt must describe the manual review opt-in"
+                "{label} must describe the manual review opt-in"
             );
-        }
-
+        });
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let tools = server.tool_router.list_all();
         let auto_improve = tools
@@ -2645,23 +2737,23 @@ mod tests {
 
     #[test]
     fn prompts_teach_cross_workspace_handoff_scope() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("memory_handoff_begin") && prompt.contains("memory_handoff_accept"),
-                "prompt must include handoff lifecycle tools"
+                "{label} must include handoff lifecycle tools"
             );
             assert!(
                 prompt.contains("workspace") && prompt.contains("project"),
-                "handoff prompt guidance must mention workspace+project scoping"
+                "{label} handoff guidance must mention workspace+project scoping"
             );
             assert!(
                 prompt.contains("sibling")
                     && (prompt.contains("workspace/project")
                         || prompt.contains("workspace + project")
                         || prompt.contains("workspace` + `project")),
-                "handoff prompt guidance must restrict explicit workspace scope to named siblings"
+                "{label} handoff guidance must restrict explicit workspace scope to named siblings"
             );
-        }
+        });
     }
 
     /// All three prompt surfaces must steer agents toward the H1-in-body
@@ -2670,22 +2762,22 @@ mod tests {
     /// fails to escape quotes (issue #67); routing every "remember this"
     /// call through the H1 path avoids the footgun entirely.
     ///
-    /// The three surfaces — `MEMORY_INSTRUCTIONS`, the routing snippet
-    /// (`SNIPPET_BODY`), and the per-tool `#[tool(description=...)]`
-    /// string surfaced via `tools/list` — are independent and must be
-    /// kept aligned per the CLAUDE.md "MCP tool surface changes" rule.
+    /// The three surfaces - `MEMORY_INSTRUCTIONS`, the installed routing
+    /// surface (`SNIPPET_BODY` plus managed skills), and the per-tool
+    /// `#[tool(description=...)]` string surfaced via `tools/list` - are
+    /// independent and must stay aligned.
     #[tokio::test]
     async fn prompts_steer_write_page_toward_h1_title_convention() {
-        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+        assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("H1"),
-                "prompt must mention the H1 title convention for memory_write_page"
+                "{label} must mention the H1 title convention for memory_write_page"
             );
             assert!(
                 prompt.contains("omit") || prompt.contains("Omit"),
-                "prompt must tell the agent to omit the `title` argument"
+                "{label} must tell the agent to omit the `title` argument"
             );
-        }
+        });
         // The third surface: the rmcp tool description sent to clients
         // via `tools/list`. Spell-checked against the same keywords so
         // that a future edit cannot silently drop the guidance from the
