@@ -4,9 +4,11 @@
 //! `setup-agent`) all emit configuration snippets that share two
 //! pieces of state:
 //!
-//! 1. The seven Claude Code lifecycle-hook events ai-memory wires
-//!    up — kept in sync between hook-bundle generation (setup-agent)
-//!    and JSON-config rendering (install-hooks).
+//! 1. The per-agent lifecycle-hook event lists ai-memory wires up
+//!    (Claude/Grok share `CLAUDE_CODE_EVENTS`; Codex, Cursor, Gemini,
+//!    and Antigravity define their own profiles) — kept in sync between
+//!    hook-bundle generation (setup-agent) and config rendering
+//!    (install-hooks).
 //! 2. The optional `Authorization: Bearer <token>` header used by
 //!    both MCP client configs (install-mcp) and hook env blocks
 //!    (install-hooks / setup-agent).
@@ -26,11 +28,11 @@ use crate::commands::path_util::strip_windows_verbatim_prefix;
 /// Claude Code lifecycle events ai-memory hooks. Each pair is
 /// `(event-name-in-Claude-Code-settings, POSIX hook-script-filename)`.
 ///
-/// Adding a hook event means updating this list AND adding the
-/// matching `.sh` and `.ps1` files under
-/// `hooks/{claude-code,codex,cursor,gemini-cli,grok,opencode}/`. The
-/// install-hooks parity test fails if the bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
+/// Adding a hook event means updating this list AND adding the matching `.sh`
+/// and `.ps1` files under the agents that use this profile (`claude-code` and
+/// `grok`). Agents with different vocabularies keep their own event arrays
+/// below. The install-hooks parity test fails if a bundle drifts.
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -38,6 +40,11 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
+    // Subagent boundaries — let the server seed/forget a subagent session id so
+    // `drop_subagent_captures` can drop the whole nested session (Claude Code +
+    // grok both emit these; other agents keep their own event lists).
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
 ];
 
 /// Format an `Authorization: Bearer <token>` header value, or `None`
@@ -77,7 +84,7 @@ pub(crate) fn ts_string_literal(s: &str) -> String {
 }
 
 /// Build the Claude Code `settings.json` fragment that wires the
-/// seven hooks. Used by both:
+/// lifecycle hooks (`CLAUDE_CODE_EVENTS`). Used by both:
 /// - `install-hooks --agent claude-code` (script paths are
 ///   wherever the user told us via `--hooks-dir`)
 /// - `setup-agent --agent claude-code` (script paths are where
@@ -841,11 +848,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_payload_has_seven_events() {
+    fn claude_code_payload_has_all_events() {
         let root = PathBuf::from("/host/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
-        assert_eq!(hooks.len(), 7);
+        assert_eq!(hooks.len(), CLAUDE_CODE_EVENTS.len());
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }

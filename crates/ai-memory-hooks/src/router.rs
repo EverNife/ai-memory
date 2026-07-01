@@ -8,14 +8,15 @@
 //! basic-memory #763). The agent never blocks on us thanks to the
 //! fire-and-forget client side.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
-    ActiveProject, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff, NewObservation,
-    NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
+    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, NewHandoff,
+    NewObservation, NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId,
+    WorkspaceId,
 };
 use ai_memory_store::WriterHandle;
 use ai_memory_wiki::Wiki;
@@ -31,7 +32,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::log;
-use crate::payload::{HookEnvelope, HookEvent, HookQuery, ProjectStrategy, parse_agent};
+use crate::payload::{
+    HookEnvelope, HookEvent, HookQuery, ProjectStrategy, body_is_subagent, parse_agent,
+};
 use crate::synth::synthesize_session_page;
 
 /// Default maximum number of hook events allowed to be processing at once.
@@ -49,6 +52,12 @@ pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Cap on scoped session ids tracked as subagents for the
+/// `drop_subagent_captures` tail-drop. Mirrors the project-cache order of
+/// magnitude: enough for high fan-out harnesses, still bounded if a client never
+/// sends a terminal `SessionEnd`.
+const SUBAGENT_SESSIONS_MAX: usize = 4096;
 
 /// Resolved-project cache key:
 /// `(cwd, workspace_override, project_override, project_strategy)`.
@@ -141,6 +150,78 @@ impl ProjectCacheStore {
     }
 }
 
+/// Shared bounded set of scoped session keys known to belong to a SUBAGENT.
+pub type SubagentSessions = Arc<tokio::sync::Mutex<SubagentSessionSet>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SubagentSessionKey {
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+}
+
+/// Tracks the scoped session keys of subagent (nested/spawned) sessions so that
+/// the `drop_subagent_captures` gate can also drop the **unmarked tail** of those
+/// sessions (`user_prompt_submit` / `stop` / `session_end`), which the
+/// per-event marker (`subagentType` / `agent_type`) does not cover. A session
+/// is seeded when a `SubagentStart` or any marker-bearing event arrives, and
+/// forgotten on `SessionEnd` after the tail has been dropped. Bounded LRU so a
+/// missed terminal event cannot leak memory.
+#[derive(Debug)]
+pub struct SubagentSessionSet {
+    ids: HashSet<SubagentSessionKey>,
+    order: VecDeque<SubagentSessionKey>,
+    max: usize,
+}
+
+impl Default for SubagentSessionSet {
+    fn default() -> Self {
+        Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            max: SUBAGENT_SESSIONS_MAX,
+        }
+    }
+}
+
+impl SubagentSessionSet {
+    /// Mark a scoped session id as a subagent (idempotent). Refreshes recency
+    /// and evicts the oldest id once the cap is exceeded.
+    fn insert(&mut self, key: SubagentSessionKey) {
+        if self.ids.contains(&key) {
+            self.touch(&key);
+            return;
+        }
+        self.ids.insert(key);
+        self.order.push_back(key);
+        while self.ids.len() > self.max {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Whether this scoped session id is a known subagent.
+    #[must_use]
+    fn contains(&self, key: &SubagentSessionKey) -> bool {
+        self.ids.contains(key)
+    }
+
+    /// Forget a scoped session id (after `SessionEnd`).
+    fn remove(&mut self, key: &SubagentSessionKey) {
+        if self.ids.remove(key) {
+            self.order.retain(|k| k != key);
+        }
+    }
+
+    fn touch(&mut self, key: &SubagentSessionKey) {
+        self.order.retain(|k| k != key);
+        self.order.push_back(*key);
+    }
+}
+
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
 pub struct HookState {
@@ -183,6 +264,13 @@ pub struct HookState {
     /// session close stays cheap; the LLM checkpoint otherwise happens on
     /// PreCompact and via manual `memory_consolidate`.
     pub consolidate_on_session_end: bool,
+    /// Scoped session keys known to be subagents (seeded by `SubagentStart` / any
+    /// marker-bearing event). For a project that opted into
+    /// `drop_subagent_captures` (via its `.ai-memory.toml`, forwarded as the
+    /// per-event `drop_subagent` flag), every event of a tracked session is
+    /// dropped — closing the unmarked tail
+    /// (`user_prompt_submit`/`stop`/`session_end`) the per-event marker misses.
+    pub subagent_sessions: SubagentSessions,
     /// Operator home directory, sourced from `Config` once at startup. The
     /// cwd->project resolver never prefix-matches a stored `repo_path` equal
     /// to this, so `$HOME` cannot become a catch-all (issue #103). `None`
@@ -207,6 +295,10 @@ async fn handle_hook(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let env = HookEnvelope::from_query_and_body(query, body);
+    // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
+    // subagent sessions) when the operator opts in. Returning 202 (not an error)
+    // means the client treats the event as delivered and never retries/spools
+    // it. Runs before the semaphore so a dropped event consumes no capacity.
     // The auth middleware in front of `/hook` injects the request's
     // [`ActorContext`] (rung 1 root, rung 2 DB user, or anonymous). We
     // capture its `user` field NOW — before the spawn drops the request
@@ -215,6 +307,13 @@ async fn handle_hook(
     let actor_user = actor_ext
         .map(|axum::Extension(ctx)| ctx.user)
         .unwrap_or_default();
+    let actor_key = ActorKey {
+        user: actor_user.clone(),
+        session_id: env.session_id.clone(),
+    };
+    if should_drop_subagent(&state, &env, &actor_key).await {
+        return (StatusCode::ACCEPTED, "subagent capture dropped");
+    }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
         warn!("hook ingest saturated; dropping event with 429");
         return (StatusCode::TOO_MANY_REQUESTS, "hook queue full");
@@ -282,26 +381,34 @@ async fn handle_hook_batch(
     let actor_user = actor_ext
         .map(|axum::Extension(ctx)| ctx.user)
         .unwrap_or_default();
-    // Hold capacity proportional to the batch size so batch ingress cannot
-    // exceed the same in-flight event bound as single `/hook` requests. Empty
-    // batches still acquire one permit to respect backpressure consistently.
-    let permits = u32::try_from(items.len().max(1)).unwrap_or(u32::MAX);
-    let Ok(permit) = state
-        .ingest_semaphore
-        .clone()
-        .try_acquire_many_owned(permits)
-    else {
-        warn!("hook batch ingest saturated; rejecting with 429");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(HookBatchAck { accepted: 0 }),
-        );
-    };
-    let _permit = permit;
     let mut accepted = 0usize;
     for item in items {
         let query = parse_hook_query(&item.url);
         let env = HookEnvelope::from_query_and_body(query, item.body);
+        let actor_key = ActorKey {
+            user: actor_user.clone(),
+            session_id: env.session_id.clone(),
+        };
+        // Accept-but-drop subagent captures (see `handle_hook`): count the item
+        // as committed so the client clears it from its spool, but do not store
+        // it. Keeps the contiguous-prefix ack contract intact.
+        if should_drop_subagent(&state, &env, &actor_key).await {
+            accepted += 1;
+            continue;
+        }
+        // Mirror single `/hook`: subagent drops consume no ingest capacity, and
+        // only events we will actually process acquire a permit. The batch loop
+        // is sequential, so one permit held across this item preserves the
+        // server-wide in-flight bound without making all-droppable batches 429
+        // under saturation.
+        let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
+            warn!(accepted, "hook batch ingest saturated; rejecting with 429");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(HookBatchAck { accepted }),
+            );
+        };
+        let _permit = permit;
         if let Err(e) = process(&state, env, actor_user.clone()).await {
             warn!(error = %e, accepted, "hook batch item failed; stopping (fail-fast)");
             break;
@@ -309,6 +416,54 @@ async fn handle_hook_batch(
         accepted += 1;
     }
     (StatusCode::OK, Json(HookBatchAck { accepted }))
+}
+
+/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
+/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
+/// session on `SubagentStart` and on any marker-bearing event; keeps it through
+/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
+/// `stop` / `session_end`) of a session already known to be a subagent. No-op
+/// (returns `false`) unless this event's project opted in via the per-event
+/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
+async fn should_drop_subagent(state: &HookState, env: &HookEnvelope, actor: &ActorKey) -> bool {
+    if !env.drop_subagent_requested {
+        return false;
+    }
+    let Ok(session_id) = resolve_session_id(env) else {
+        return false;
+    };
+    let Ok((workspace_id, project_id)) = resolve_project_ids(
+        state,
+        env.cwd.as_deref(),
+        env.workspace_override.as_deref(),
+        env.project_override.as_deref(),
+        env.project_strategy,
+        actor,
+    )
+    .await
+    else {
+        return false;
+    };
+    let key = SubagentSessionKey {
+        workspace_id,
+        project_id,
+        session_id,
+    };
+    let marked = matches!(
+        env.event,
+        HookEvent::SubagentStart | HookEvent::SubagentStop
+    ) || body_is_subagent(&env.raw);
+
+    if marked {
+        state.subagent_sessions.lock().await.insert(key);
+        return true;
+    }
+
+    let tracked = state.subagent_sessions.lock().await.contains(&key);
+    if tracked && matches!(env.event, HookEvent::SessionEnd) {
+        state.subagent_sessions.lock().await.remove(&key);
+    }
+    tracked
 }
 
 /// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
@@ -1101,7 +1256,10 @@ const fn importance_for(event: HookEvent) -> u8 {
         HookEvent::UserPrompt => 8,
         HookEvent::PostToolUse | HookEvent::PreToolUse => 5,
         HookEvent::Stop | HookEvent::PreCompact => 6,
-        HookEvent::Notification | HookEvent::Other => 3,
+        HookEvent::Notification
+        | HookEvent::Other
+        | HookEvent::SubagentStart
+        | HookEvent::SubagentStop => 3,
     }
 }
 
@@ -1143,6 +1301,7 @@ mod tests {
             project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             home_dir: None,
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
@@ -1324,6 +1483,336 @@ mod tests {
         assert_eq!(ack["accepted"], 2, "both events committed, oldest-first");
     }
 
+    /// `pre-tool-use` query+agent for building an env to recompute a SessionId.
+    fn grok_tool_query() -> HookQuery {
+        HookQuery {
+            event: "pre-tool-use".into(),
+            agent: Some("grok".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_drops_subagent_events_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // A grok subagent tool-use event (carries `subagentType`) alongside a
+        // top-level event (no marker), in ONE batch.
+        let sub_body = serde_json::json!({
+            "sessionId": "sub-s1", "subagentType": "general-purpose", "toolName": "x"
+        });
+        let top_body = serde_json::json!({ "sessionId": "top-s1", "toolName": "x" });
+        // The project opted in (`.ai-memory.toml` → `drop_subagent=1`), so every
+        // event carries the flag; only the actual subagent capture is dropped.
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: sub_body.clone(),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: top_body.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Accept-but-drop: BOTH are acked so the client clears its spool…
+        assert_eq!(
+            ack["accepted"], 2,
+            "both acked so the client clears its spool"
+        );
+
+        // …but only the top-level event was persisted; the subagent left nothing.
+        let sub_sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            grok_tool_query(),
+            sub_body,
+        ))
+        .unwrap();
+        let top_sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            grok_tool_query(),
+            top_body,
+        ))
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "subagent capture must not be persisted"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(top_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "top-level capture is persisted as usual"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_keeps_subagent_events_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // No `drop_subagent` flag on the request → the project did not opt in,
+        // so its subagent captures are stored as usual.
+        let sub_body = serde_json::json!({
+            "sessionId": "sub-s2", "subagentType": "general-purpose", "toolName": "x"
+        });
+        let items = vec![HookBatchItem {
+            url: "http://h/hook?event=pre-tool-use&agent=grok".into(),
+            body: sub_body.clone(),
+        }];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sub_sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            grok_tool_query(),
+            sub_body,
+        ))
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "without the per-project opt-in, subagent captures are stored (default behavior)"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_subagent_captures_drops_unmarked_tail_of_tracked_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // (1) marked subagent event seeds session "sub" (and is dropped);
+        // (2) a later UNMARKED event on "sub" is the tail → dropped via tracking;
+        // (3) an UNMARKED event on a never-seeded session "top" → kept.
+        let marked = serde_json::json!({
+            "sessionId": "sub", "subagentType": "general-purpose", "toolName": "x"
+        });
+        let tail = serde_json::json!({ "sessionId": "sub", "toolName": "y" });
+        let top = serde_json::json!({ "sessionId": "top", "toolName": "z" });
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: marked,
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: tail.clone(),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: top.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 3, "all acked: 2 dropped + 1 processed");
+
+        let sub_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(grok_tool_query(), tail))
+                .unwrap();
+        let top_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(grok_tool_query(), top)).unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the unmarked tail of a tracked subagent session is dropped"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(top_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an unmarked event on a non-subagent session is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_start_event_seeds_the_session_so_its_tail_drops() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        // SubagentStart seeds session "ss" BEFORE its first content event, so even
+        // the leading unmarked user_prompt_submit is dropped.
+        let start = serde_json::json!({ "sessionId": "ss" });
+        let lead = serde_json::json!({ "sessionId": "ss", "prompt": "go" });
+        let items = vec![
+            HookBatchItem {
+                url: "http://h/hook?event=subagent-start&agent=grok&drop_subagent=1".into(),
+                body: start,
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=grok&drop_subagent=1".into(),
+                body: lead.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(State(state.clone()), None, Json(items))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("grok".into()),
+                ..Default::default()
+            },
+            lead,
+        ))
+        .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "SubagentStart seeds the session so the leading unmarked event drops too"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_subagent_tracking_is_scoped_by_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let actor = ai_memory_core::ActorKey::default();
+
+        let marked_project_a = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("grok".into()),
+                project: Some("project-a".into()),
+                drop_subagent: Some("1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionId": "shared-session", "subagentType": "general-purpose"
+            }),
+        );
+        assert!(should_drop_subagent(&state, &marked_project_a, &actor).await);
+
+        let unmarked_project_b = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("grok".into()),
+                project: Some("project-b".into()),
+                drop_subagent: Some("1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionId": "shared-session", "toolName": "kept" }),
+        );
+        assert!(
+            !should_drop_subagent(&state, &unmarked_project_b, &actor).await,
+            "a subagent session tracked in project-a must not drop same-id events in project-b"
+        );
+
+        let unmarked_project_a = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("grok".into()),
+                project: Some("project-a".into()),
+                drop_subagent: Some("1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "sessionId": "shared-session", "toolName": "dropped" }),
+        );
+        assert!(
+            should_drop_subagent(&state, &unmarked_project_a, &actor).await,
+            "the originally tracked project's unmarked tail still drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_keeps_session_tracked_until_session_end_tail_drops() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let actor = ai_memory_core::ActorKey::default();
+
+        let query = |event: &str| HookQuery {
+            event: event.into(),
+            agent: Some("grok".into()),
+            project: Some("tail-project".into()),
+            drop_subagent: Some("1".into()),
+            ..Default::default()
+        };
+
+        let start = HookEnvelope::from_query_and_body(
+            query("subagent-start"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(should_drop_subagent(&state, &start, &actor).await);
+
+        let subagent_stop = HookEnvelope::from_query_and_body(
+            query("subagent-stop"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(should_drop_subagent(&state, &subagent_stop, &actor).await);
+
+        let unmarked_stop_tail = HookEnvelope::from_query_and_body(
+            query("stop"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(
+            should_drop_subagent(&state, &unmarked_stop_tail, &actor).await,
+            "SubagentStop must not clear tracking before the unmarked stop tail"
+        );
+
+        let session_end_tail = HookEnvelope::from_query_and_body(
+            query("session-end"),
+            serde_json::json!({ "sessionId": "tail-session" }),
+        );
+        assert!(
+            should_drop_subagent(&state, &session_end_tail, &actor).await,
+            "SessionEnd tail is dropped and then clears tracking"
+        );
+
+        let after_session_end = HookEnvelope::from_query_and_body(
+            query("pre-tool-use"),
+            serde_json::json!({ "sessionId": "tail-session", "toolName": "kept" }),
+        );
+        assert!(
+            !should_drop_subagent(&state, &after_session_end, &actor).await,
+            "SessionEnd clears tracking for that scoped session"
+        );
+    }
+
     #[tokio::test]
     async fn handle_hook_batch_returns_429_when_saturated() {
         let tmp = TempDir::new().unwrap();
@@ -1341,6 +1830,69 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_drops_subagent_events_before_capacity_check() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                body: serde_json::json!({
+                    "sessionId": "saturated-subagent", "subagentType": "general-purpose"
+                }),
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], 1,
+            "droppable subagent batch items should clear the spool even when ingest capacity is saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_saturated_after_prefix_reports_accepted_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                    body: serde_json::json!({
+                        "sessionId": "saturated-prefix", "subagentType": "general-purpose"
+                    }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=user-prompt-submit&agent=grok".into(),
+                    body: serde_json::json!({
+                        "sessionId": "saturated-prefix", "prompt": "retry later"
+                    }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 1, "429 still reports the committed prefix");
     }
 
     #[tokio::test]
@@ -1367,7 +1919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_hook_batch_acquires_capacity_per_item() {
+    async fn handle_hook_batch_processes_sequentially_with_one_permit() {
         let tmp = TempDir::new().unwrap();
         let mut state = make_state(&tmp).await;
         state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1386,7 +1938,15 @@ mod tests {
             .await
             .into_response();
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], 2,
+            "batch processing is sequential, so one permit is enough for processed items"
+        );
     }
 
     #[test]
