@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
-    AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, ProviderAuth,
-    ProviderChoice, ProviderConfig,
+    AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, OPENCODE_DEFAULT_MODEL,
+    ProviderAuth, ProviderChoice, ProviderConfig,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -196,6 +196,7 @@ pub struct RuntimeEnv {
     copilot_api_url: Option<String>,
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
+    opencode_api_key: Option<SecretString>,
 }
 
 impl RuntimeEnv {
@@ -223,6 +224,7 @@ impl RuntimeEnv {
             copilot_api_url: env_string("COPILOT_API_URL"),
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
+            opencode_api_key: env_secret("OPENCODE_API_KEY"),
         }
     }
 
@@ -645,10 +647,11 @@ impl Config {
             "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
             "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
             "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
+            "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth"
+                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
                 )));
             }
         };
@@ -668,6 +671,7 @@ impl Config {
                             .into(),
                     ));
                 }
+                ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
             },
         };
         Ok(Some(ProviderConfig {
@@ -764,6 +768,7 @@ impl Config {
             ProviderChoice::OpenAiOAuth => None,
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
+            ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
         }
     }
 

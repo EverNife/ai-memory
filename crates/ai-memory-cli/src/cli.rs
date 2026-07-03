@@ -820,6 +820,8 @@ pub enum LlmProviderChoice {
     OpenaiOauth,
     /// GitHub Copilot Chat backend.
     Copilot,
+    /// OpenCode Zen/Go cloud API.
+    Opencode,
 }
 
 /// Arguments for `embed`.
