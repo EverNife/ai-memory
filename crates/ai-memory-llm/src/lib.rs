@@ -39,6 +39,7 @@ pub mod oidc;
 pub mod openai;
 pub mod openai_compat;
 pub mod openai_oauth;
+pub mod opencode;
 pub mod provider;
 pub mod types;
 
@@ -70,6 +71,7 @@ pub use oidc::{
 };
 pub use openai::OpenAiProvider;
 pub use openai_compat::OpenAiCompatProvider;
+pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
 pub use openai_oauth::{
     CODEX_CLIENT_ID, CODEX_RESPONSES_URL, OPENAI_OAUTH_AUTH_URL, OPENAI_OAUTH_ISSUER,
     OPENAI_OAUTH_TOKEN_URL, OpenAiOAuthProvider, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
