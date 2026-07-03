@@ -36,7 +36,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::render_shared::{
-    CLAUDE_CODE_EVENTS, build_claude_code_payload, build_grok_payload,
+    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
+    GEMINI_PROFILE, build_claude_code_payload, build_grok_payload,
     hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -60,21 +61,13 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     };
     if matches!(
         args.agent,
-        AgentChoice::OpenCode | AgentChoice::Omp | AgentChoice::Openclaw
+        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw
     ) {
-        emit_extension_setup_hint(&args);
+        emit_extension_setup_hint(&args)?;
         return Ok(());
     }
-    let agent_sub = match args.agent {
-        AgentChoice::ClaudeCode => "claude-code",
-        AgentChoice::Codex => "codex",
-        AgentChoice::Cursor => "cursor",
-        AgentChoice::GeminiCli => "gemini-cli",
-        AgentChoice::AntigravityCli => "antigravity-cli",
-        AgentChoice::Grok => "grok",
-        AgentChoice::OpenCode => unreachable!("opencode handled above"),
-        AgentChoice::Omp => unreachable!("omp handled above"),
-        AgentChoice::Openclaw => unreachable!("openclaw handled above"),
+    let Some(agent_sub) = args.agent.script_hook_subdir() else {
+        bail!("internal: generated integration should have returned before staging hooks")
     };
 
     let source = resolve_source(args.source.as_deref(), agent_sub)?;
@@ -130,16 +123,21 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     match args.agent {
         AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
         AgentChoice::Grok => emit_grok(&emit_root, &args)?,
-        AgentChoice::Codex
-        | AgentChoice::Cursor
-        | AgentChoice::GeminiCli
-        | AgentChoice::AntigravityCli => {
-            emit_other(&emit_root, agent_sub, &args);
+        AgentChoice::Codex => emit_other(&emit_root, agent_sub, &args, &[CODEX_PROFILE.events]),
+        AgentChoice::Cursor => emit_other(&emit_root, agent_sub, &args, &[CURSOR_PROFILE.events]),
+        AgentChoice::GeminiCli => {
+            emit_other(&emit_root, agent_sub, &args, &[GEMINI_PROFILE.events]);
         }
-        AgentChoice::OpenCode => unreachable!("opencode handled above"),
-        AgentChoice::Omp => unreachable!("omp handled above"),
-        AgentChoice::Openclaw => {
-            unreachable!("openclaw handled by the generated-integration hint above");
+        AgentChoice::AntigravityCli => emit_other(
+            &emit_root,
+            agent_sub,
+            &args,
+            &[&ANTIGRAVITY_TOOL_EVENTS, &ANTIGRAVITY_LIFECYCLE_EVENTS],
+        ),
+        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw => {
+            bail!(
+                "internal: generated integration should have returned before emitting staged hooks"
+            )
         }
     }
     Ok(())
@@ -149,7 +147,7 @@ fn normalise_hook_server_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-fn emit_extension_setup_hint(args: &SetupAgentArgs) {
+fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
     let (label, agent, restart_note, mcp_client) = match args.agent {
         AgentChoice::OpenCode => (
             "OpenCode",
@@ -161,6 +159,12 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) {
             "OMP",
             "omp",
             "Then restart OMP so it loads ~/.omp/agent/extensions/ai-memory.ts.",
+            "omp",
+        ),
+        AgentChoice::Pi => (
+            "Pi",
+            "pi",
+            "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts.",
             "pi",
         ),
         AgentChoice::Openclaw => (
@@ -169,7 +173,7 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) {
             "Then restart the OpenClaw gateway if it does not auto-restart after plugin install.",
             "openclaw",
         ),
-        _ => unreachable!("only generated-integration agents reach this hint"),
+        other => bail!("internal: {other:?} is not a generated-integration agent"),
     };
     println!("# {label} uses a TypeScript extension/plugin, not extracted shell scripts.");
     println!("# Install it directly instead:");
@@ -183,7 +187,14 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) {
     }
     println!();
     println!("{restart_note}");
-    println!("Also run `ai-memory install-mcp --client {mcp_client}` to wire MCP separately.");
+    if matches!(args.agent, AgentChoice::Pi) {
+        println!(
+            "MCP tools come through the same generated Pi bridge extension; no native mcp.json is written."
+        );
+    } else {
+        println!("Also run `ai-memory install-mcp --client {mcp_client}` to wire MCP separately.");
+    }
+    Ok(())
 }
 
 fn emit_claude_code(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
@@ -226,7 +237,12 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
-fn emit_other(emit_root: &Path, label: &str, args: &SetupAgentArgs) {
+fn emit_other(
+    emit_root: &Path,
+    label: &str,
+    args: &SetupAgentArgs,
+    event_lists: &[&[(&str, &str)]],
+) {
     // These clients have hook surfaces, but their print-mode config
     // snippets are intentionally conservative: apply-mode owns the
     // exact merge/plugin generation where ai-memory knows the format.
@@ -238,13 +254,23 @@ fn emit_other(emit_root: &Path, label: &str, args: &SetupAgentArgs) {
         println!("#       value you passed via --auth-token (not echoed).");
     }
     println!();
-    for (_, script) in CLAUDE_CODE_EVENTS {
-        let script = hook_script_for_current_platform(script);
-        println!("- {}", emit_root.join(script.as_ref()).display());
+    for path in event_script_paths(emit_root, event_lists) {
+        println!("- {}", path.display());
     }
     println!();
     println!("Set AI_MEMORY_HOOK_URL in each hook's environment to override the default.");
     println!("Also run `ai-memory install-mcp --client {label}` to wire MCP separately.");
+}
+
+fn event_script_paths(emit_root: &Path, event_lists: &[&[(&str, &str)]]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for events in event_lists {
+        for (_, script) in *events {
+            let script = hook_script_for_current_platform(script);
+            paths.push(emit_root.join(script.as_ref()));
+        }
+    }
+    paths
 }
 
 fn is_hook_script_file(path: &Path) -> bool {
@@ -378,5 +404,47 @@ mod tests {
     fn source_candidates_honour_explicit_override() {
         let candidates = source_candidates(Some(Path::new("/custom/src")), "codex", None);
         assert_eq!(candidates, vec![PathBuf::from("/custom/src/codex")]);
+    }
+
+    #[test]
+    fn pi_setup_prints_extension_hint_without_copying() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let args = SetupAgentArgs {
+            agent: AgentChoice::Pi,
+            to: tmp.path().join("hooks"),
+            host_prefix: None,
+            server_url: "http://127.0.0.1:49374".into(),
+            auth_token: None,
+            source: Some(tmp.path().join("source")),
+        };
+
+        run(&Config::default(), args).unwrap();
+
+        assert!(!tmp.path().join("hooks").exists());
+    }
+
+    #[test]
+    fn manual_script_paths_use_agent_specific_events() {
+        let root = Path::new("/hooks/gemini-cli");
+        let paths = event_script_paths(root, &[GEMINI_PROFILE.events]);
+        let rendered = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("session-start"));
+        assert!(rendered.contains("session-end"));
+        assert!(rendered.contains("pre-tool-use"));
+        assert!(rendered.contains("post-tool-use"));
+        assert!(rendered.contains("pre-compact"));
+        assert!(
+            !rendered.contains("user-prompt-submit"),
+            "Gemini has no UserPromptSubmit hook; setup-agent must not print Claude-only scripts"
+        );
+        assert!(
+            !rendered.contains("subagent-start") && !rendered.contains("subagent-stop"),
+            "Gemini has no subagent hook events; setup-agent must not print nonexistent scripts"
+        );
     }
 }

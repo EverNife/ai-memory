@@ -46,8 +46,10 @@ from hook paths.
 1. Agent CLI emits a lifecycle hook (SessionStart, UserPromptSubmit,
    PostToolUse, …). Shell-script hooks `curl` event JSON to `POST /hook`
    with a short timeout. Native `ai-memory hook --event ...` commands spool
-   events locally and drain them at session boundaries; high-latency
-   operators can raise the drain/handoff caps with minute-based env vars.
+   events locally, do a short bounded cleanup at session start, and hand
+   session-end delivery to a detached lock-aware `hook-drain` helper;
+   high-latency operators can raise the drain/handoff/background caps with
+   minute-based env vars.
    Agent hot paths never block on the network; saturated servers return HTTP
    429 instead of queueing unbounded work.
 2. Server's hook router sanitises the payload (the only path from
@@ -57,9 +59,8 @@ from hook paths.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
    `Handoff` row for the next agent. Auto-commits the wiki. Clients
-   without a true session-end hook (currently OpenCode and Antigravity
-   CLI) should call `memory_handoff_begin` before quitting when a
-   handoff is needed.
+   without a true session-end hook (currently Antigravity CLI) should call
+   `memory_handoff_begin` before quitting when a handoff is needed.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
@@ -233,7 +234,7 @@ invariants below.
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
-| `memory_install_self_routing` | read-only | Return the canonical routing snippet for CLAUDE.md / AGENTS.md. |
+| `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
 `memory_install_self_routing`, `memory_read_page`, `memory_delete_page`,
@@ -244,13 +245,20 @@ prose halves of "what's going on", `memory_write_page` covers explicit
 durable annotations without abusing single-use handoffs,
 `memory_install_self_routing` exists for the meta case where the agent
 must re-write its own routing rules into a project's `CLAUDE.md` /
-`AGENTS.md`, `memory_read_page` complements `memory_query` for the
-"I need the full page, not a snippet" case (e.g. opening a decision page
-end-to-end), `memory_auto_improve` exposes a safe default-on learning review
-through the same approval/write path as pending writes, and `memory_delete_page` is the exact-path destructive pair
+`AGENTS.md` and install the companion managed Agent Skills into
+`.claude/skills` or `.agents/skills`, `memory_read_page` complements
+`memory_query` for the "I need the full page, not a snippet" case
+(e.g. opening a decision page end-to-end), `memory_auto_improve` exposes a
+safe default-on learning review through the same approval/write path as
+pending writes, and `memory_delete_page` is the exact-path destructive pair
 needed by admission-aware mirrors. `memory_handoff_cancel` is the safety valve
 for mistaken handoff creation. The narrow-surface discipline still holds —
 every new tool has to earn its slot — but the v1 count is 16, not 10.
+
+The managed Agent Skills are a narrow prompt-packaging exception to the
+otherwise wiki-centered architecture. They are static `SKILL.md` files that
+teach agents when to call ai-memory MCP tools; they are not durable wiki pages,
+not auto-improvement output, and not a runtime skill router inside ai-memory.
 
 MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
@@ -268,7 +276,7 @@ checkpoints          restore-page         llm-test
 forget-sweep         lint                 auto-improve
 auto-improve-report  curator              pending-writes       embed
 generate-auth-token  setup-agent          bootstrap
-install-instructions reorg                purge-project
+install-instructions install-skills        reorg
 rename-project       move-project         audit-contamination
 uninstall            auth                 user
 ```

@@ -10,7 +10,7 @@
 #       | bash -s -- --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|pi>
+#   --agent <claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -66,10 +66,18 @@ if [[ "$AGENT" == "openclaw" ]]; then
     exit 0
 fi
 
-if [[ "$AGENT" == "omp" || "$AGENT" == "pi" || "$AGENT" == "oh-my-pi" ]]; then
+if [[ "$AGENT" == "omp" || "$AGENT" == "oh-my-pi" ]]; then
     echo "OMP uses a generated TypeScript extension, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent omp --apply"
     echo "Then restart OMP so it loads ~/.omp/agent/extensions/ai-memory.ts."
+    exit 0
+fi
+
+if [[ "$AGENT" == "pi" ]]; then
+    echo "Pi uses a generated TypeScript extension, not shell hook scripts."
+    echo "Run: ai-memory install-hooks --agent pi --apply"
+    echo "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts."
+    echo "MCP tools come through the same generated bridge extension."
     exit 0
 fi
 

@@ -58,6 +58,15 @@ pub struct AutoImproveCandidateSession {
     pub ended_at: i64,
 }
 
+/// Open session selected for manual finalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSession {
+    /// Session id.
+    pub session_id: SessionId,
+    /// Captured session cwd, if available.
+    pub cwd: Option<String>,
+}
+
 /// The latest version of a page's stored content, used as a DB-backed
 /// fallback when the on-disk markdown read fails (index/disk skew). The
 /// markdown file is the source of truth, but the store keeps a faithful copy
@@ -1009,6 +1018,83 @@ impl ReaderPool {
             row_opt
                 .map(|bytes| SessionId::from_slice(&bytes).map_err(StoreError::from))
                 .transpose()
+        })
+        .await
+    }
+
+    /// Return open sessions matching one scoped project and agent.
+    ///
+    /// Results are newest-first so callers can default to finalizing only the
+    /// latest open session while offering an explicit all-sessions mode.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_sessions_for_scope_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<OpenSession>> {
+        let agent = agent_kind.as_str().to_string();
+        self.with_conn(move |conn| {
+            let limit_clause = limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1)));
+            let sql = format!(
+                "SELECT id, cwd FROM sessions \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND agent_kind = ?3 AND ended_at IS NULL \
+                 ORDER BY started_at DESC, id DESC{limit_clause}"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let cwd: Option<String> = row.get(1)?;
+                    Ok((id_bytes, cwd))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, cwd) = row?;
+                out.push(OpenSession {
+                    session_id: SessionId::from_slice(&id_bytes)?,
+                    cwd,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// True when a session exists, belongs to the resolved scope and agent, and
+    /// is still open. Used by SessionEnd ingestion to avoid synthesizing pages
+    /// or handoffs for stale, cross-project, or cross-agent synthetic events.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_is_open_for_scope_agent(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent_kind: AgentKind,
+    ) -> StoreResult<bool> {
+        let agent = agent_kind.as_str().to_string();
+        self.with_conn(move |conn| {
+            let count: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM sessions \
+                 WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                   AND agent_kind = ?4 AND ended_at IS NULL",
+                params![
+                    session_id.as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    agent,
+                ],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
         })
         .await
     }
@@ -3465,15 +3551,13 @@ impl ReaderPool {
     ///
     /// - `workspace_id = ?1` — never matches a project in another
     ///   workspace.
-    /// - `repo_path IS NOT NULL AND length(repo_path) > 1 AND repo_path
-    ///   NOT LIKE '%/'` — rejects stored values that would match too
-    ///   broadly (`NULL`, `''`, `/`) or fail the `<repo_path>/%`
-    ///   boundary (trailing slash).
-    /// - Stored `repo_path` wildcards (`%`, `_`) are escaped in the
-    ///   generated `LIKE` pattern, so they stay literal path bytes
-    ///   instead of matching unintended siblings.
-    /// - `?3 IS NULL OR repo_path <> ?3` — never matches a stored
-    ///   `repo_path` equal to the operator's home directory (`home`).
+    /// - `repo_path IS NOT NULL` plus Rust-side normalization rejects stored
+    ///   values that would match too broadly (`NULL`, `''`, `/`) or fail the
+    ///   `<repo_path>/%` boundary (trailing slash/backslash).
+    /// - Stored `repo_path` wildcards (`%`, `_`) are compared as literal path
+    ///   bytes in Rust, not as SQL `LIKE` wildcards.
+    /// - A normalized stored `repo_path` equal to the operator's home
+    ///   directory (`home`) is never matched.
     ///   Such a row would be a prefix catch-all for every project
     ///   beneath `$HOME`; the caller passes the server's own `$HOME`
     ///   (filesystem root `/` is already excluded by the
@@ -3495,38 +3579,49 @@ impl ReaderPool {
         cwd: String,
         home: Option<&str>,
     ) -> StoreResult<Option<(ProjectId, String)>> {
-        let home = home.map(str::to_owned);
-        let cwd_norm = cwd.trim_end_matches('/').to_string();
+        let home = home.map(|h| normalize_cwd(h).into_owned());
+        let cwd_norm = normalize_cwd(&cwd).into_owned();
         if !is_safe_cwd_for_prefix_match(&cwd_norm) {
             return Ok(None);
         }
         self.with_conn(move |conn| {
-            // Two-condition LIKE: exact match OR descendant (prefix +
-            // `/`). The boundary `/` on the descendant arm stops
-            // `/foo/bar` from matching `/foo/ba`. The LIKE arm escapes
-            // stored wildcard characters so real paths containing `%` or
-            // `_` stay literal instead of turning into broad matches.
-            let row_opt = conn
-                .query_row(
-                    "SELECT id, name FROM projects \
-                     WHERE workspace_id = ?1 \
-                       AND repo_path IS NOT NULL \
-                       AND length(repo_path) > 1 \
-                       AND repo_path NOT LIKE '%/' \
-                       AND (?3 IS NULL OR repo_path <> ?3) \
-                       AND (?2 = repo_path OR ?2 LIKE replace(replace(replace(repo_path, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\') \
-                     ORDER BY length(repo_path) DESC \
-                     LIMIT 1",
-                    params![workspace_id.as_bytes(), cwd_norm, home],
-                    |row| {
-                        let bytes: Vec<u8> = row.get(0)?;
-                        let name: String = row.get(1)?;
-                        Ok((bytes, name))
-                    },
-                )
-                .optional()?;
-            row_opt
-                .map(|(bytes, name)| {
+            // Compare in Rust instead of SQL LIKE so stored `%`/`_` bytes stay
+            // literal and legacy Windows rows with backslashes keep matching a
+            // slash-normalized hook cwd. New writes normalize `repo_path`, but
+            // this compatibility read path protects existing databases.
+            let mut stmt = conn.prepare(
+                "SELECT id, name, repo_path FROM projects \
+                 WHERE workspace_id = ?1 AND repo_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![workspace_id.as_bytes()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut matches = Vec::new();
+            for row in rows {
+                let (bytes, name, repo_path) = row?;
+                if has_trailing_path_separator(&repo_path) {
+                    continue;
+                }
+                let repo_norm = normalize_cwd(&repo_path).into_owned();
+                if repo_norm.len() <= 1
+                    || !is_safe_cwd_for_prefix_match(&repo_norm)
+                    || home.as_deref() == Some(repo_norm.as_str())
+                {
+                    continue;
+                }
+                if cwd_within(&repo_norm, &cwd_norm) {
+                    matches.push((bytes, name, repo_norm.len()));
+                }
+            }
+            matches.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+            matches
+                .into_iter()
+                .next()
+                .map(|(bytes, name, _)| {
                     ProjectId::from_slice(&bytes)
                         .map(|id| (id, name))
                         .map_err(StoreError::from)
@@ -3560,7 +3655,7 @@ impl ReaderPool {
         home: Option<&str>,
     ) -> StoreResult<ContaminationReport> {
         let scoped = scope.is_some();
-        let home = home.map(str::to_owned);
+        let home = home.map(|h| normalize_cwd(h).into_owned());
         let scope_params: Vec<Value> = match &scope {
             Some((ws, proj)) => vec![
                 Value::Blob(ws.as_bytes().to_vec()),
@@ -3686,7 +3781,14 @@ impl ReaderPool {
                         })?;
                         for r in rows {
                             let (ws_b, proj_b, name, repo_path) = r?;
-                            if home.as_deref() == Some(repo_path.as_str()) {
+                            if has_trailing_path_separator(&repo_path) {
+                                continue;
+                            }
+                            let repo_path = normalize_cwd(&repo_path).into_owned();
+                            if repo_path.len() <= 1
+                                || !is_safe_cwd_for_prefix_match(&repo_path)
+                                || home.as_deref() == Some(repo_path.as_str())
+                            {
                                 continue;
                             }
                             prefixes.push((
@@ -3707,7 +3809,14 @@ impl ReaderPool {
                         })?;
                         for r in rows {
                             let (ws_b, proj_b, name, repo_path) = r?;
-                            if home.as_deref() == Some(repo_path.as_str()) {
+                            if has_trailing_path_separator(&repo_path) {
+                                continue;
+                            }
+                            let repo_path = normalize_cwd(&repo_path).into_owned();
+                            if repo_path.len() <= 1
+                                || !is_safe_cwd_for_prefix_match(&repo_path)
+                                || home.as_deref() == Some(repo_path.as_str())
+                            {
                                 continue;
                             }
                             prefixes.push((
@@ -3727,13 +3836,12 @@ impl ReaderPool {
         // CHECK A: resolve each session's cwd against preloaded valid prefixes
         // and flag a bucket mismatch.
         for (id, ws, landed_proj, landed_ws_name, landed_proj_name, cwd) in candidates {
-            let cwd_norm = cwd.trim_end_matches('/').to_string();
+            let cwd_norm = normalize_cwd(&cwd).into_owned();
             if !is_safe_cwd_for_prefix_match(&cwd_norm) {
                 continue;
             }
             let resolved = prefixes.iter().find(|(prefix_ws, _, _, repo_path)| {
-                *prefix_ws == ws
-                    && (cwd_norm == *repo_path || cwd_norm.starts_with(&format!("{repo_path}/")))
+                *prefix_ws == ws && cwd_within(repo_path, &cwd_norm)
             });
             if let Some((_, resolved_proj, resolved_name, _)) = resolved
                 && *resolved_proj != landed_proj
@@ -4738,6 +4846,10 @@ fn is_safe_cwd_for_prefix_match(cwd: &str) -> bool {
     true
 }
 
+fn has_trailing_path_separator(path: &str) -> bool {
+    path.len() > 1 && path.ends_with(['/', '\\'])
+}
+
 fn checkout(inner: &Inner) -> StoreResult<Connection> {
     if let Some(conn) = inner.pool.lock().pop() {
         return Ok(conn);
@@ -5117,5 +5229,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(widened, None, "wildcards in repo_path must stay literal");
+    }
+
+    #[tokio::test]
+    async fn prefix_match_handles_legacy_windows_backslash_repo_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = ProjectId::new();
+        let conn =
+            rusqlite::Connection::open(tmp.path().join("db").join(crate::DB_FILENAME)).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                project_id.as_bytes(),
+                ws.as_bytes(),
+                "app",
+                r"C:\Users\tester\app",
+                jiff::Timestamp::now().as_microsecond()
+            ],
+        )
+        .unwrap();
+
+        let matched = store
+            .reader
+            .find_project_by_cwd_prefix(
+                ws,
+                String::from("C:/Users/tester/app/crates/core"),
+                Some(r"C:\Users\tester"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(matched.map(|(id, _)| id), Some(project_id));
+    }
+
+    #[tokio::test]
+    async fn prefix_match_ignores_legacy_trailing_separator_repo_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = ProjectId::new();
+        let conn =
+            rusqlite::Connection::open(tmp.path().join("db").join(crate::DB_FILENAME)).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                project_id.as_bytes(),
+                ws.as_bytes(),
+                "legacy-trailing",
+                "/repo/foo/",
+                jiff::Timestamp::now().as_microsecond()
+            ],
+        )
+        .unwrap();
+
+        let matched = store
+            .reader
+            .find_project_by_cwd_prefix(ws, String::from("/repo/foo/bar"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(matched, None, "legacy trailing separator must not match");
     }
 }

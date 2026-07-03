@@ -9,13 +9,14 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, VS Code Copilot)
+  (Codex, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
   (cargo install, building from source)
 - [LLM provider tiers + self-hosted Ollama](#llm-provider-tiers)
 - [Subcommand reference](#subcommand-reference)
+- [Managed routing snippets and Agent Skills](#managed-routing-snippets-and-agent-skills)
 - [Operating without auth](#operating-without-auth) (local-only)
 - [Keeping ai-memory up to date](#keeping-ai-memory-up-to-date)
 
@@ -71,12 +72,14 @@ The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
 `setup-agent`: with `AI_MEMORY_SERVER_URL` set, `install-mcp` derives the
 `/mcp` endpoint and `install-hooks` uses the bare server origin.
 
-After upgrading ai-memory, refresh the managed routing block in existing
+After upgrading ai-memory, refresh the managed routing package in existing
 projects so Claude Code/OpenCode/Codex/Gemini pick up new tool guidance and
 proactive retrieval rules. From an agent, ask "refresh the ai-memory routing in
 this project"; from the terminal, run `ai-memory install-instructions` (or pass
-`--target AGENTS.md` for non-Claude prompt files). The update is idempotent and
-only replaces the `<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` block.
+`--target AGENTS.md` for non-Claude prompt files). The update is idempotent:
+legacy long snippets between `<!-- ai-memory:start -->` /
+`<!-- ai-memory:end -->` are replaced in place with the slim snippet, and
+managed Agent Skills are installed or updated alongside it.
 
 ---
 
@@ -319,6 +322,20 @@ ai-memory auth login oidc-device \
   --client-id "ai-memory-cli"
 ```
 
+The stored OIDC access token is also used by thin-client HTTP commands
+(`status`, `search`, `read-page`, `write-page`, `backup`, `embed`, and
+similar) when no static `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is
+configured. Static bearer auth still has precedence. This is for external
+OIDC-aware gateways/bridges; native ai-memory server auth still uses static root
+bearer / DB-user tokens, and `/admin/*` remains root-only unless a gateway
+translates accepted OIDC auth into upstream auth that ai-memory accepts.
+
+OIDC/Keycloak `sid` claims describe the login provider's session, not the
+coding-agent session ai-memory uses for `[auto_scope]` isolation. Gateways may
+propagate the authenticated user/client/agent headers, but
+`X-Memory-Actor-Session-Id` should only contain a real lifecycle-hook session id
+from a session-aware bridge.
+
 Restart the service after changing provider settings:
 
 ```bash
@@ -351,17 +368,24 @@ then stages runnable copies under `~/.local/share/ai-memory/hooks/<agent>/` so
 the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
-Native `ai-memory hook --event ...` commands spool events locally and drain them
-at session boundaries. The built-in timings stay short by default, but
-high-latency or large-backlog instances can raise them with whole-minute runtime
-env vars in the agent's environment; no `install-hooks` rerun is needed:
+Native `ai-memory hook --event ...` commands spool events locally. Session start
+does a short bounded cleanup drain before fetching a handoff; cancellation-prone
+boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
+`hook-drain` helper so delivery does not depend on one shutdown hook surviving.
+On Unix, the helper uses a trusted `setsid` launcher when available and falls
+back to a separate process group otherwise; Windows uses detached/breakaway
+process flags. The spool is capped, so a permanently undrained backlog is
+eventually pruned rather than unbounded, but old undelivered events can be lost.
+The built-in timings stay short on agent-facing paths, but high-latency or
+large-backlog instances can raise them with whole-minute runtime env vars in the
+agent's environment; no `install-hooks` rerun is needed:
 
 | Env var | Built-in default | Max override | What it caps |
 |---|---:|---:|---|
 | `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | each event POST during a drain |
 | `AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES` | 3 seconds | 60 minutes | the synchronous `session-start` handoff GET |
-| `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time the `session-start` cleanup drain may spend |
-| `AI_MEMORY_HOOK_END_BUDGET_MINUTES` | 10 seconds | 60 minutes | total time the `session-end` flush may spend |
+| `AI_MEMORY_HOOK_START_BUDGET_MINUTES` | 3 seconds | 60 minutes | total time `session-start` may spend waiting for the drain lock and cleanup draining |
+| `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` | 5 minutes | 60 minutes | total time the detached `hook-drain` helper may spend after a background-drain boundary |
 | `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` | 32 events | positive integer | spool backlog size that triggers a 250 ms `post-tool-use` catch-up drain |
 
 Timing values must be positive whole minutes. Missing, empty, non-numeric, or
@@ -464,8 +488,11 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, and OpenClaw have lifecycle
 > bundled scripts to your home dir, (2) `docker run --rm install-hooks`
 > to render the config snippet.
 > On native Windows, Claude Code is the exception to the PowerShell default:
-> it runs hooks through Git Bash, so ai-memory renders `bash -c` commands for
-> the `.sh` scripts.
+> it uses Claude exec form (`command` = real `ai-memory.exe`, `args` = argv
+> tokens for `hook --event ...`) by default. Set
+> `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` to opt back into
+> Git Bash `bash -c` commands for the `.sh` scripts, including for older Claude
+> Code builds that do not support exec form.
 > OpenClaw, OpenCode, and OMP are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
@@ -486,6 +513,16 @@ docker run --rm akitaonrails/ai-memory:latest \
         --hooks-dir ~/.ai-memory/hooks \
         --server-url "http://homelab:49374" \
         --auth-token "$TOKEN"
+```
+
+Codex still does not expose a reliable true session-end hook. Its `Stop` hook is
+captured as a turn/stop observation only; ai-memory does **not** treat it as
+SessionEnd. When you need the final session summary, handoff, and
+auto-improvement eligibility for the current project, run:
+
+```bash
+ai-memory finalize-session
+# add --all to close every matching open Codex session in this workspace/project
 ```
 
 ### OpenCode
@@ -516,7 +553,7 @@ loaded at startup.
 
 ```bash
 docker run --rm akitaonrails/ai-memory:latest \
-    install-mcp --client pi \
+    install-mcp --client omp \
     --server-url "http://homelab:49374/mcp" \
     --auth-token "$TOKEN"
 
@@ -528,9 +565,28 @@ ai-memory install-hooks --agent omp --apply \
 ```
 
 Restart OMP after installing or changing the extension; extensions are
-loaded at startup. The ai-memory CLI accepts `--client pi` /
-`--client omp` for MCP and `--agent omp` / `--agent pi` for hooks;
-all four target the same current Oh My Pi integration surface.
+loaded at startup. The ai-memory CLI accepts `--client omp` (or
+`--client oh-my-pi`) for MCP and `--agent omp` (or `--agent oh-my-pi`)
+for hooks; both target OMP's native `.omp` integration surface.
+
+### Pi
+
+Pi does not read a native `mcp.json`. ai-memory supports Pi through one
+generated TypeScript extension at `~/.pi/agent/extensions/ai-memory.ts`; the
+same file captures lifecycle events and bridges ai-memory's HTTP MCP tools into
+Pi with `pi.registerTool`.
+
+```bash
+ai-memory install-hooks --agent pi --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+# `install-mcp --client pi` prints this guidance instead of writing mcp.json:
+ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
+```
+
+Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
+separate and continues to use `.omp` paths.
 
 ### Bind mounts vs docker cp
 
@@ -641,15 +697,28 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|pi`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
-OpenClaw, and OMP do not need script extraction because `install-hooks`
-generates TypeScript plugin/extension files for them instead.
+OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
+`install-hooks` generates TypeScript plugin/extension files for them
+instead. For Pi, the generated extension also provides the MCP bridge.
 
 This path is friction-free when:
 - You have curl + bash but not docker
 - You don't need to run a local ai-memory server (you're a client of
   a homelab/remote ai-memory)
+
+### Hook command paths across a container boundary
+
+`install-hooks --apply` stages the hook scripts into the data dir and
+writes their absolute paths into the agent's config. When the CLI runs
+inside a container but the agent runs on the host, those staged paths
+would be container paths the host can't see. Set
+`AI_MEMORY_HOOKS_HOST_ROOT` to the *host* directory that the staged
+`hooks/` tree is mounted from and the rendered config uses
+`<host-root>/<agent>/…` command paths instead. The bundled docker
+wrappers (`bin/ai-memory`, `bin/ai-memory.ps1`) forward this variable
+automatically; you only set it by hand for custom container setups.
 
 ---
 
@@ -695,8 +764,8 @@ architecture: `aarch64` for Apple Silicon, `x86_64` for Intel. On Windows, see
 The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
 Native Windows agents can use the tagged `ai-memory-windows-x86_64.zip`, the
-Docker Desktop wrapper, or a source build. Native Claude Code uses direct
-`ai-memory.exe hook` commands by default; other native Windows script-hook
+Docker Desktop wrapper, or a source build. Native Claude Code uses Claude exec
+form with a real `ai-memory.exe` by default; other native Windows script-hook
 agents use PowerShell `.ps1` defaults.
 
 When run from source, `install-hooks` finds the bundled scripts in
@@ -939,12 +1008,81 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
 | `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
-| `auth login oidc-device` | same developer data dir as native hooks | Store a per-developer OIDC device token for native hook authentication |
+| `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
 | `install-hooks --agent` | `docker run --rm` | Hook-config snippet for an existing hooks dir |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |
-| `uninstall --apply` | same host environment used for install | Remove only ai-memory-owned hooks, MCP entries, and instruction blocks; generated plugin files are deleted only after content validation. Use `--mcp-url` for custom MCP endpoints and `--mcp-name` only to narrow removal. |
+| `install-instructions [--target] [--print] [--no-skills]` | same host environment used for the agent prompt files | Install or update the slim CLAUDE.md / AGENTS.md routing block and, by default, the managed ai-memory Agent Skills |
+| `install-skills [--scope] [--agent]` | same host environment used for the agent skill dirs | Install or update only the managed ai-memory Agent Skills |
+| `uninstall --apply` | same host environment used for install | Remove only ai-memory-owned hooks, MCP entries, instruction blocks, managed skill files, and generated plugin files after content/marker validation. Use `--mcp-url` for custom MCP endpoints and `--mcp-name` only to narrow removal. |
 | `llm-test --provider …` | `docker run --rm -e …` | Smoke-test an LLM provider |
+
+### Managed routing snippets and Agent Skills
+
+ai-memory's routing install is agent-facing prompt packaging. It does not add a
+runtime skill router, and `SKILL.md` files are not durable memory pages. The
+wiki remains the durable source of truth.
+
+`ai-memory install-instructions` now writes two managed prompt artifacts by
+default:
+
+1. A slim instruction block in `CLAUDE.md`, `AGENTS.md`, or the file passed with
+   `--target`. The block is bounded by `<!-- ai-memory:start -->` and
+   `<!-- ai-memory:end -->`.
+2. Managed ai-memory Agent Skills containing the detailed tool-routing guidance.
+
+Re-running the command is safe. If a project still has the old long ai-memory
+block between those markers, the refresh replaces that block in place with the
+slim snippet, leaves unrelated instructions before and after it alone, and
+writes a timestamped `.bak-*` backup before changing an existing file.
+Managed skill files contain an ai-memory ownership marker; same-name user skills
+without that marker are preserved unless you explicitly force replacement.
+`install-instructions --print` previews only the instruction snippet; run
+`install-skills --print` when you want to preview the managed skill payloads.
+
+`install-instructions` flags for skills:
+
+| Flag | Meaning |
+|---|---|
+| `--no-skills` | Refresh only the markered instruction block. |
+| `--skills-scope <scope>` | Choose project-local or user-global skill roots. Values: `project`, `global`. Defaults to `project`. |
+| `--skills-agent <agent>` | Choose `.claude/skills`, `.agents/skills`, or both. Values: `claude-code`, `agents`, `both`. By default, `CLAUDE.md` targets imply `claude-code`, `AGENTS.md` targets imply `agents`, and both instruction files imply `both`. |
+| `--skills-target-dir <dir>` | Write managed skill directories below an explicit root instead of inferring from scope and agent. |
+| `--skills-force` | Replace unmanaged same-name skills during `install-instructions`; without it, they are left untouched and the command exits with an actionable error. |
+
+Use `install-skills` when the instruction block is already right and only the
+Agent Skill files need a refresh:
+
+```bash
+ai-memory install-skills
+ai-memory install-skills --scope global --agent agents
+ai-memory install-skills --agent both --print
+ai-memory install-skills --target-dir .custom/skills --force
+```
+
+`install-skills` flags:
+
+| Flag | Meaning |
+|---|---|
+| `--scope <scope>` | Install into this project or the current user's global skill roots. Values: `project`, `global`. Defaults to `project`. |
+| `--agent <agent>` | Install into Claude Code's skill root, the cross-agent skill root, or both. Values: `claude-code`, `agents`, `both`. Defaults to `claude-code`. |
+| `--target-dir <dir>` | Write managed skill directories below an explicit root; `--scope` and `--agent` are ignored. |
+| `--print` | Print target paths and `SKILL.md` contents without writing files. |
+| `--force` | Replace unmanaged same-name skills; without it, user-authored same-name skills are preserved. |
+
+Default skill target roots:
+
+| Scope | `--agent claude-code` | `--agent agents` |
+|---|---|---|
+| `project` | `.claude/skills` | `.agents/skills` |
+| `global` | `~/.claude/skills` | `~/.agents/skills` |
+
+Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
+
+`ai-memory uninstall --only skills --apply` removes managed skill files only
+from the default project/global roots shown above, after validating the
+ai-memory ownership marker. If you installed with `--target-dir` or
+`--skills-target-dir`, clean up that custom root manually.
 
 Data dir inside the container is `/data` (mounted via the compose
 volume). Outside docker, override with `AI_MEMORY_DATA_DIR=/path`.
@@ -1130,8 +1268,8 @@ write to `~/.local/share/ai-memory/hooks/`.
 
 - [`docs/deploy.md`](deploy.md) - homelab deploy walkthrough
   (`bin/deploy`, cloudflared TLS, env-file management)
-- [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI,
-  routing snippet, migration from other memory tools, and raw-wiki inspection
+- [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI, slim
+  routing snippet + managed Agent Skills, migration from other memory tools, and raw-wiki inspection
 - [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config
   reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually

@@ -47,6 +47,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
 
+  # Native Windows is where the `#[cfg(windows)]` regression tests (drain
+  # lock ERROR_LOCK_VIOLATION, libgit2 path-resolution fallback, verbatim
+  # path handling) actually run — the test matrix above never compiles
+  # them. Observability only for now (`continue-on-error`): a Windows
+  # runner-environment quirk must not block Linux/macOS merges, but the
+  # results are visible on every push so Windows-only breakage is caught
+  # in review instead of by end users.
+  test-windows:
+    name: test (windows-latest, non-gating)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+        env:
+          TAILWIND_SKIP: "1"
+
+  # The companion importer is deliberately outside the root workspace
+  # (its own [workspace] in companions/ai-memory-importer/Cargo.toml), so
+  # none of the jobs above compile it. Gate it here with the same
+  # fmt/clippy/test trio docs/companion-crates.md prescribes, or a
+  # toolchain bump / convention change rots it silently.
+  companions:
+    name: companions (ai-memory-importer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: companions/ai-memory-importer
+      - run: cargo fmt --check --manifest-path companions/ai-memory-importer/Cargo.toml
+      - run: cargo clippy --manifest-path companions/ai-memory-importer/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path companions/ai-memory-importer/Cargo.toml
+
   # Build the release binary on its own so a release-only failure
   # (LTO crash, codegen issue, dead-code-with-debug-assertions) doesn't
   # ship to Docker Hub silently.
@@ -134,6 +173,8 @@ jobs:
           cargo audit
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0320
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
 
   gitleaks:
     name: gitleaks (secret scan)

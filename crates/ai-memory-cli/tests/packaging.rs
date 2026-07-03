@@ -1,6 +1,7 @@
 //! Packaging asset regression tests.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 fn repo_root() -> PathBuf {
@@ -17,6 +18,25 @@ fn read_repo(path: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+// Unix-only alongside run_wrapper_on_fake_macos below — these helpers'
+// former Git Bash arms existed to run the wrapper test on Windows, which
+// the fake-uname executable-bit limitation rules out anyway.
+#[cfg(unix)]
+fn shell_script_command(script: &Path) -> Command {
+    Command::new(script)
+}
+
+#[cfg(unix)]
+fn shell_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+// Unix-only: the macOS simulation works by shadowing `uname` with a fake
+// script earlier in PATH, which requires setting its executable bit. NTFS
+// has no mode bits, so on a Windows host MSYS bash skips the non-executable
+// fake and the real `uname.exe` reports MSYS_NT-* — the Darwin arm under
+// test can never fire there.
+#[cfg(unix)]
 fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
     let tmp = tempfile::tempdir().unwrap();
     let docker_args = tmp.path().join("docker-args.txt");
@@ -26,7 +46,7 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
         &docker,
         format!(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\n",
-            docker_args.display()
+            shell_path(&docker_args)
         ),
     )
     .unwrap();
@@ -40,16 +60,17 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
 
     let path = format!(
         "{}:{}",
-        tmp.path().display(),
+        shell_path(tmp.path()),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = Command::new(repo_root().join("bin/ai-memory"))
+    let mut command = shell_script_command(&repo_root().join("bin/ai-memory"));
+    let output = command
         .args(args)
         .env("PATH", path)
-        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_DOCKER", shell_path(&docker))
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
-        .env("HOME", tmp.path())
+        .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
         .output()
         .unwrap();
@@ -153,6 +174,7 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
     assert!(ci.contains("--target runtime-prebuilt-amd64"));
 }
 
+#[cfg(unix)]
 #[test]
 fn macos_wrapper_routes_urls_by_real_subcommand() {
     for subcommand in ["install-mcp", "install-hooks", "setup-agent"] {

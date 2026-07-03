@@ -113,6 +113,7 @@ pub fn get_or_create_project(
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<ai_memory_core::ProjectId> {
+    let repo_path = repo_path.map(normalize_repo_path_key);
     let tx = conn.transaction()?;
     let existing: Option<Vec<u8>> = tx
         .query_row(
@@ -132,7 +133,7 @@ pub fn get_or_create_project(
                 id.as_bytes(),
                 workspace_id.as_bytes(),
                 name,
-                repo_path,
+                repo_path.as_deref(),
                 Timestamp::now().as_microsecond()
             ],
         )?;
@@ -165,6 +166,7 @@ pub fn get_or_create_project(
 /// temporarily unmounted drive, and destroying it would wipe a valid prefix
 /// key. This safety rule is mandatory.
 pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> StoreResult<u64> {
+    let home = home.map(normalize_repo_path_key);
     let candidates: Vec<(Vec<u8>, String)> = {
         let mut stmt =
             conn.prepare("SELECT id, repo_path FROM projects WHERE repo_path IS NOT NULL")?;
@@ -175,7 +177,7 @@ pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> S
     };
     let to_null: Vec<Vec<u8>> = candidates
         .into_iter()
-        .filter(|(_, repo_path)| should_heal_repo_path(repo_path, home))
+        .filter(|(_, repo_path)| should_heal_repo_path(repo_path, home.as_deref()))
         .map(|(id, _)| id)
         .collect();
     let tx = conn.transaction()?;
@@ -192,7 +194,8 @@ pub fn heal_catch_all_repo_paths(conn: &mut Connection, home: Option<&str>) -> S
 /// Decide whether a non-NULL `repo_path` is a prefix-match catch-all that
 /// should be NULLed. See [`heal_catch_all_repo_paths`] for the full rule.
 fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
-    if repo_path == "/" || home == Some(repo_path) {
+    let repo_path_key = normalize_repo_path_key(repo_path);
+    if repo_path_key == "/" || home == Some(repo_path_key.as_str()) {
         return true; // broad sentinels, healed even if they look like git roots
     }
     let p = std::path::Path::new(repo_path);
@@ -202,6 +205,15 @@ fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
     // a `.git` file); a `.git` stat error preserves the row, same as the
     // path-existence check above.
     matches!(p.try_exists(), Ok(true)) && matches!(p.join(".git").try_exists(), Ok(false))
+}
+
+fn normalize_repo_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.len() > 1 {
+        normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    }
 }
 
 fn scheduler_state_table_exists(conn: &Connection) -> StoreResult<bool> {
@@ -259,6 +271,7 @@ pub fn ensure_project_with_id(
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<()> {
+    let repo_path = repo_path.map(normalize_repo_path_key);
     conn.execute(
         "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING",
@@ -266,7 +279,7 @@ pub fn ensure_project_with_id(
             id.as_bytes(),
             workspace_id.as_bytes(),
             name,
-            repo_path,
+            repo_path.as_deref(),
             Timestamp::now().as_microsecond()
         ],
     )?;
@@ -282,7 +295,7 @@ pub fn ensure_project_with_id(
         Some((existing_ws, existing_name, existing_repo_path))
             if existing_ws.as_slice() == workspace_id.as_bytes()
                 && existing_name == name
-                && existing_repo_path.as_deref() == repo_path =>
+                && existing_repo_path.as_deref() == repo_path.as_deref() =>
         {
             Ok(())
         }
@@ -1908,6 +1921,7 @@ mod tests {
             AgentKind::OpenClaw,
             AgentKind::AntigravityCli,
             AgentKind::Omp,
+            AgentKind::Pi,
             AgentKind::Grok,
             AgentKind::Other,
         ] {
@@ -2635,6 +2649,123 @@ mod tests {
         assert_eq!(fk_violations, 0, "V20 must leave foreign keys clean");
     }
 
+    #[test]
+    fn v25_adds_pi_and_preserves_sessions_invariants_on_upgraded_db() {
+        use ai_memory_core::{AgentKind, NewSession, SessionId};
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let ws;
+        let proj;
+        let existing_sid = SessionId::new();
+
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            crate::migrations::run_to(&mut conn, 24).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            ws = get_or_create_workspace(&mut conn, "default").unwrap();
+            proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+            begin_session(
+                &mut conn,
+                &NewSession {
+                    id: existing_sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        crate::migrations::run_to(&mut conn, 25).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Pi,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session_count, 2, "V25 must preserve existing sessions");
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' \
+                   AND name IN ('idx_sessions_recent', 'idx_sessions_project', 'idx_sessions_started_at', 'idx_sessions_scope_ended')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 4, "V25 must recreate sessions indexes");
+
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'sessions_ws_proj_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            trigger_count, 1,
+            "V25 must recreate the V18 pairing trigger"
+        );
+
+        let scheduler_trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'auto_improve_scheduler_claims_session_pairing_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler_trigger_count, 1,
+            "V25 must recreate the V22 scheduler/session pairing trigger"
+        );
+
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_proj =
+            get_or_create_project(&mut conn, &other_ws, "other-project", None).unwrap();
+        let err = begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: other_proj,
+                agent_kind: AgentKind::Pi,
+                cwd: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("sessions.workspace_id does not match"),
+            "pairing trigger must reject split-brain sessions after V25: {err}"
+        );
+
+        let fk_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_violations, 0, "V25 must leave foreign keys clean");
+    }
+
     /// V19 is idempotent: re-running on a repaired DB is a no-op.
     /// Also asserts the initial run on a clean DB (no orphans, no
     /// empty fragments) is a no-op.
@@ -3093,12 +3224,12 @@ mod tests {
         );
         assert_eq!(
             read_repo_path(&conn, &git_proj),
-            Some(git_path),
+            Some(normalize_repo_path_key(&git_path)),
             "real git work-tree root must be preserved"
         );
         assert_eq!(
             read_repo_path(&conn, &gone_proj),
-            Some(gone_path),
+            Some(normalize_repo_path_key(&gone_path)),
             "path absent on this host must be preserved (multi-user/unmounted safety)"
         );
     }

@@ -21,13 +21,14 @@
 | Linux | Supported | Primary Docker/server target and CI platform. Published Docker images support `linux/amd64` and `linux/arm64`. Native Arch/AUR packages include system and user systemd units. |
 | macOS | Supported | Workspace tests run in CI; tagged releases publish native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz` binaries. The native binary is the recommended path on Apple Silicon. See [`docs/macos.md`](docs/macos.md). |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
-| Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Claude Code uses direct native `ai-memory.exe hook` commands by default; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
+| Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Claude Code uses Claude exec form with a real native `ai-memory.exe` by default; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks. |
-| Codex | Supported | MCP config + lifecycle hooks. |
+| Codex | Supported | MCP config + lifecycle hooks; no automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin. |
 | Cursor | Supported | MCP config + lifecycle hooks. |
 | Gemini CLI | Supported | MCP config + lifecycle hooks. |
-| Oh My Pi / OMP | Supported | `pi` / `omp` aliases for MCP config + TypeScript extension. |
+| Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension. |
+| Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; use `install-hooks --agent pi --apply`. |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
@@ -72,7 +73,8 @@ priors are at the [bottom](#influences-and-prior-art).
   Same page path can exist in two projects without collision; a
   rename is one column update; a purge is one `rm -rf`.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
-  at session-end (or PreCompact), not retrieved over raw logs.
+  at session-end (or PreCompact; Codex can use `ai-memory finalize-session`
+  for a manual final close), not retrieved over raw logs.
   Supersession chain + git-versioned markdown means you can
   time-travel with `ai-memory checkpoints`, `restore-page`, or raw `git log`.
 - **Built-in `/web` browser.** Read-only HTML UI for the wiki -
@@ -81,7 +83,8 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
   Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, Oh My Pi / OMP
-  (`pi` / `omp` aliases), and VS Code GitHub Copilot agent mode
+  (`omp` / `oh-my-pi`), Pi via generated bridge extension, and VS Code GitHub
+  Copilot agent mode
   (MCP-only, workspace `.vscode/mcp.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
@@ -94,7 +97,9 @@ priors are at the [bottom](#influences-and-prior-art).
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
-  single source of truth.
+  single source of truth. `finalize-session` is the exception: it reads the
+  local SQLite index only to find matching open sessions, then posts synthetic
+  `session-end` hooks back to the server.
 - **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
   rule-based summarisation. Add a provider when you want consolidated
   pages, lint contradictions, or staged auto-improvement proposals.
@@ -255,7 +260,8 @@ docker run -d --name ai-memory \
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts + auto-detecting ~/.claude/settings.json. Re-run with
 #    `--agent codex`, `--agent opencode`, `--agent gemini-cli`,
-#    `--agent omp`/`pi`, `--client cursor`, `--client gemini-cli`, etc.
+#    `--agent omp`, `--agent oh-my-pi`, `--client cursor`,
+#    `--client gemini-cli`, etc.
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
@@ -290,16 +296,21 @@ loopback server. With the local Docker quick start above, no
 `AI_MEMORY_SERVER_URL` override is needed.
 
 To remove ai-memory later, run `ai-memory uninstall --apply` from the
-same host environment. It removes ai-memory-owned config entries and
-generated plugin files only after matching their ai-memory signatures;
-use `--mcp-url` if you installed MCP with a custom endpoint, and
-`--mcp-name` only when you need to narrow removal to one matching entry.
+same host environment. It removes ai-memory-owned config entries, instruction
+blocks, default-root managed skill files, and generated plugin files only after
+matching their ai-memory signatures; custom skill roots installed with
+`--target-dir` are cleaned up manually. Use `--mcp-url` if you installed MCP
+with a custom endpoint, and `--mcp-name` only when you need to narrow removal to
+one matching entry.
 
 ### Install Notes
 
 - **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
-  from PowerShell/cmd. Native Claude Code uses Git Bash `.sh` hooks; other
-  script-hook agents use PowerShell defaults. Do not mix path worlds. See
+  from PowerShell/cmd. Native Claude Code uses Claude exec form with a real
+  `ai-memory.exe` by default, with `AI_MEMORY_HOOK_PLATFORM=windows-bash`
+  available for Git Bash `.sh` hooks and older Claude Code builds; other
+  script-hook agents use PowerShell defaults. Do not
+  mix path worlds. See
   [`docs/windows.md`](docs/windows.md).
 - **Docker compose:** `docker compose -f docker/docker-compose.yml up -d`
   is supported; agent setup is the same as step 3 above.
@@ -315,10 +326,10 @@ use `--mcp-url` if you installed MCP with a custom endpoint, and
   `ai-memory install-hooks --agent <agent> --apply` after upgrading the binary.
   Remote/homelab servers must still be redeployed separately; local wrapper
   upgrade only updates the client machine. Existing project prompt files keep
-  working, but refresh the managed ai-memory routing block
+  working. Refresh the managed ai-memory routing package
   (`ai-memory install-instructions`, or `--target AGENTS.md` for AGENTS-based
-  projects) when you want new tool guidance such as proactive retrieval and
-  `memory_auto_improve`.
+  projects) when you want new tool guidance. The refresh writes the slim
+  markered snippet and managed Agent Skills from the same binary-owned assets.
 
 For Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI,
 Grok Build CLI, OpenClaw, VS Code Copilot, curl-based hook installs, source builds,
@@ -371,7 +382,18 @@ ai-memory install-hooks --agent claude-code --apply \
 
 OIDC hook auth requires the native `ai-memory hook ...` command path. The Docker
 wrapper keeps shell-script hooks by default; set up OIDC from a native release
-binary or source install.
+binary or source install. Thin-client HTTP commands such as `ai-memory status`
+and `ai-memory search` also use the stored OIDC access token when no static
+`AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is configured; the static bearer
+still wins when present. This is for OIDC-aware gateways/bridges; native
+ai-memory server auth still accepts static root bearer / DB-user tokens, and
+`/admin/*` remains root-only unless a gateway translates accepted OIDC auth into
+upstream auth that ai-memory accepts.
+
+OIDC/Keycloak session ids are login-provider sessions, not ai-memory agent
+sessions. Shared servers that rely on `[auto_scope]` session isolation still
+need explicit `workspace` + `project` / `scopes`, or a bridge that forwards the
+real lifecycle-hook session id on MCP requests.
 
 **Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
 the right answer is a battle-tested reverse proxy in front of it.
@@ -473,16 +495,18 @@ Useful entry points:
   `/wiki/web`. Set `--web-slug /` if you want the browser or custom SPA at
   `/wiki` itself.
 
-Install the routing snippet once so agents proactively call the right
-MCP tool for those prompts:
+Install the managed routing package once so agents proactively call the
+right MCP tool for those prompts:
 
 ```bash
 ai-memory install-instructions
 ```
 
-See [`docs/usage.md`](docs/usage.md) for handoff examples, proactive
-query routing, bootstrap details, web UI screenshots, and the raw-wiki
-inspection commands. CLI URL/auth configuration lives in
+That command writes or updates the slim `<!-- ai-memory:start -->` block and
+the managed ai-memory Agent Skills that carry the detailed routing guidance.
+See [`docs/usage.md`](docs/usage.md) for handoff examples, proactive query
+routing, bootstrap details, web UI screenshots, and the raw-wiki inspection
+commands. CLI URL/auth configuration lives in
 [`docs/install.md`](docs/install.md#configuring-the-cli-url-and-auth).
 
 ## LLM Providers
@@ -577,7 +601,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | File | What it is |
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
-| [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, routing snippet, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
+| [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
 | [`docs/macos.md`](docs/macos.md) | macOS install paths: native release binary (recommended), source build, the Docker wrapper, hook-platform notes, and current macOS limitations. |

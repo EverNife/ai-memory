@@ -23,8 +23,10 @@ use crate::cli::{AgentChoice, InstallHooksArgs, McpClient};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
+use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
-    CURSOR_PROFILE, GEMINI_PROFILE, build_antigravity_payload_with_data_dir,
+    ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
+    GEMINI_PROFILE, build_antigravity_payload_with_data_dir,
     build_claude_code_payload_with_data_dir, build_grok_payload_with_data_dir,
     build_profile_payload_for_agent, hook_script_for_claude_code, hook_script_for_current_platform,
     ts_string_literal,
@@ -33,7 +35,7 @@ use crate::config::{Config, DEFAULT_SERVER_URL};
 
 /// `~/.claude/settings.json` — Claude Code hooks live under `hooks`.
 pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.claude/settings.json")?
         .join(".claude")
         .join("settings.json"))
@@ -41,7 +43,7 @@ pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.codex/hooks.json`.
 pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.codex/hooks.json")?
         .join(".codex")
         .join("hooks.json"))
@@ -49,7 +51,7 @@ pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.cursor/hooks.json`.
 pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.cursor/hooks.json")?
         .join(".cursor")
         .join("hooks.json"))
@@ -57,7 +59,7 @@ pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.gemini/settings.json`.
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.gemini/settings.json")?
         .join(".gemini")
         .join("settings.json"))
@@ -65,7 +67,7 @@ pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.gemini/config/hooks.json` — Antigravity CLI lifecycle hooks.
 pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.gemini/config/hooks.json")?
         .join(".gemini")
         .join("config")
@@ -74,7 +76,7 @@ pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.grok/hooks/ai-memory.json` — Grok Build CLI lifecycle hooks.
 pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.grok/hooks/ai-memory.json")?
         .join(".grok")
         .join("hooks")
@@ -83,7 +85,7 @@ pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.config/opencode/plugins/ai-memory.ts` — OpenCode's plugin file.
 pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.config/opencode")?
         .join(".config")
         .join("opencode")
@@ -93,9 +95,19 @@ pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.omp/agent/extensions/ai-memory.ts` — OMP lifecycle extension.
 pub(crate) fn omp_extension_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(home_dir()
         .context("could not locate $HOME for ~/.omp/agent/extensions")?
         .join(".omp")
+        .join("agent")
+        .join("extensions")
+        .join("ai-memory.ts"))
+}
+
+/// `~/.pi/agent/extensions/ai-memory.ts` — Pi lifecycle + MCP bridge extension.
+pub(crate) fn pi_extension_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.pi/agent/extensions")?
+        .join(".pi")
         .join("agent")
         .join("extensions")
         .join("ai-memory.ts"))
@@ -133,6 +145,7 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
     if args.apply {
         return match args.agent {
             AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
+            AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args),
             AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args),
             AgentChoice::ClaudeCode => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -176,6 +189,7 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
     let strategy = args.project_strategy.baked();
     match args.agent {
         AgentChoice::OpenCode => render_opencode_plugin(&server_url, auth, strategy),
+        AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy),
         AgentChoice::Omp => render_omp_extension(&server_url, auth, strategy),
         AgentChoice::ClaudeCode => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -183,19 +197,47 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
         }
         AgentChoice::Codex => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_agent("codex", &hooks_dir, &server_url, auth, strategy)
+            render_agent(
+                "codex",
+                &hooks_dir,
+                &server_url,
+                auth,
+                strategy,
+                &[CODEX_PROFILE.events],
+            )
         }
         AgentChoice::Cursor => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_agent("cursor", &hooks_dir, &server_url, auth, strategy)
+            render_agent(
+                "cursor",
+                &hooks_dir,
+                &server_url,
+                auth,
+                strategy,
+                &[CURSOR_PROFILE.events],
+            )
         }
         AgentChoice::GeminiCli => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_agent("gemini-cli", &hooks_dir, &server_url, auth, strategy)
+            render_agent(
+                "gemini-cli",
+                &hooks_dir,
+                &server_url,
+                auth,
+                strategy,
+                &[GEMINI_PROFILE.events],
+            )
         }
         AgentChoice::AntigravityCli => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_agent("antigravity-cli", &hooks_dir, &server_url, auth, strategy)
+            render_agent(
+                "antigravity-cli",
+                &hooks_dir,
+                &server_url,
+                auth,
+                strategy,
+                &[&ANTIGRAVITY_TOOL_EVENTS, &ANTIGRAVITY_LIFECYCLE_EVENTS],
+            )
         }
         AgentChoice::Grok => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -297,7 +339,8 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Option<InferredMcpConfig> {
         McpClient::Openclaw => {
             infer_json_mcp_config(&content, &["mcp", "servers", "ai-memory"], "url")
         }
-        McpClient::Pi => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
+        McpClient::Omp => infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "url"),
+        McpClient::Pi => None,
         McpClient::AntigravityCli => {
             infer_json_mcp_config(&content, &["mcpServers", "ai-memory"], "serverUrl")
         }
@@ -318,12 +361,12 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Cursor => Some(McpClient::Cursor),
         AgentChoice::GeminiCli => Some(McpClient::GeminiCli),
         AgentChoice::OpenCode => Some(McpClient::OpenCode),
-        AgentChoice::Omp => Some(McpClient::Pi),
+        AgentChoice::Omp => Some(McpClient::Omp),
         AgentChoice::Openclaw => Some(McpClient::Openclaw),
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
         // Grok manages its own MCP config under ~/.grok/; we don't
         // auto-infer a hook server URL from it.
-        AgentChoice::Grok => None,
+        AgentChoice::Pi | AgentChoice::Grok => None,
     }
 }
 
@@ -397,22 +440,32 @@ fn bearer_token_from_header(header: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// True if a hook-array entry belongs to ai-memory — i.e. some command
-/// string inside it mentions the `ai-memory` binary/script. Used to
-/// replace our own entries on re-apply while preserving hooks that other
-/// tools registered under the same event.
+/// True if a hook-array entry belongs to ai-memory — i.e. some command handler
+/// inside it is one of our legacy command strings or one of our exec-form native
+/// hook handlers. Used to replace our own entries on re-apply while preserving
+/// hooks that other tools registered under the same event.
 fn is_ai_memory_hook_entry(entry: &serde_json::Value) -> bool {
     fn mentions_ai_memory(value: &serde_json::Value) -> bool {
-        value
-            .get("command")
-            .and_then(|c| c.as_str())
-            .map(|c| c.to_ascii_lowercase())
-            // Case-insensitive, and matches BOTH the binary/script path
-            // (`ai-memory`) AND the inlined env vars (`AI_MEMORY_HOOK_URL` /
-            // `AI_MEMORY_AUTH_TOKEN`). The env vars are present in every
-            // command shape (native, bash, PowerShell), so detection works
-            // even when the hooks dir path has no "ai-memory" in it.
-            .is_some_and(|c| c.contains("ai-memory") || c.contains("ai_memory"))
+        let Some(command) = value.get("command").and_then(|c| c.as_str()) else {
+            return false;
+        };
+        let lower = command.to_ascii_lowercase();
+        let args = value.get("args").and_then(|a| a.as_array());
+        let Some(args) = args else {
+            // Legacy shell/string form: broad matching is intentional because
+            // old installs may identify us by the binary/script path or by the
+            // inlined AI_MEMORY_* env vars.
+            return lower.contains("ai-memory") || lower.contains("ai_memory");
+        };
+        let tokens: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+        // Exec form: require both an ai-memory-ish executable and our hook argv
+        // signature so unrelated helpers such as `ai-memory-helper.exe` are not
+        // removed just because their executable name contains ai-memory.
+        (lower.contains("ai-memory") || lower.contains("ai_memory"))
+            && tokens.contains(&"hook")
+            && tokens.contains(&"--event")
+            && tokens.contains(&"--agent")
+            && tokens.contains(&"--server-url")
     }
     // Flat shape (Cursor): `{ "type":"command", "command":"…" }`.
     // Nested shape (Claude Code / Codex / Gemini):
@@ -452,9 +505,9 @@ fn overlay_event_hooks(
     map.insert(event.to_string(), serde_json::Value::Array(entries));
 }
 
-/// Mutate `~/.claude/settings.json` in place: replace the seven hook
-/// entries ai-memory cares about; preserve every other hook the user
-/// has wired up to other tools.
+/// Mutate `~/.claude/settings.json` in place: replace the hook entries
+/// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
+/// user has wired up to other tools.
 fn apply_to_claude_code_settings(
     hooks_dir: &Path,
     server_url: &str,
@@ -514,7 +567,7 @@ fn apply_to_claude_code_settings(
 
 /// Mutate `~/.grok/hooks/ai-memory.json` so Grok Build CLI fires the ai-memory
 /// lifecycle hooks. Grok's hook config is structurally identical to Claude
-/// Code's nested hook JSON and uses the same seven CamelCase event names, but
+/// Code's nested hook JSON and uses the same CamelCase event names, but
 /// its script bundle carries `agent=grok` and skips destructive SessionStart
 /// handoff fetches. We merge into a dedicated `ai-memory.json` (Grok discovers
 /// every `~/.grok/hooks/*.json`), so a pre-existing third-party hook file is
@@ -1028,9 +1081,11 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     const workspace = tomlKey(body, "workspace");
     const project = tomlKey(body, "project");
     const projectStrategy = tomlKey(body, "project_strategy");
+    const dropSubagent = tomlKey(body, "drop_subagent_captures");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
+    if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
     if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
       const repoProject = repoRootProject(cwd);
       if (repoProject) url.searchParams.set("project", repoProject);
@@ -1046,6 +1101,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let workspace: string | undefined;
   let project: string | undefined;
   let projectStrategy: string | undefined;
+  let dropSubagent: string | undefined;
   const marker = findMarker(cwd);
   if (marker) {
     try {
@@ -1053,6 +1109,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       workspace = tomlKey(body, "workspace");
       project = tomlKey(body, "project");
       projectStrategy = tomlKey(body, "project_strategy");
+      dropSubagent = tomlKey(body, "drop_subagent_captures");
     } catch (_e) {
     }
   }
@@ -1064,6 +1121,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (workspace) url.searchParams.set("workspace", workspace);
   if (project) url.searchParams.set("project", project);
   if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
+  if (dropSubagent) url.searchParams.set("drop_subagent", dropSubagent);
 }"#;
     format!(
         "const DEFAULT_PROJECT_STRATEGY = {};\n{body}",
@@ -1104,6 +1162,92 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 
 function authHeaders(): Record<string, string> {{
   return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+}}
+
+const HOOK_QUEUE_MAX = 100;
+const HOOK_FLUSH_INTERVAL_MS = 2000;
+const HOOK_FLUSH_THRESHOLD = 20;
+const HOOK_INTER_REQUEST_DELAY_MS = 50;
+const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
+const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
+
+type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
+const hookQueue: HookQueueItem[] = [];
+let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
+let hookDraining = false;
+let hookDrainPromise: Promise<void> | undefined;
+
+function sleep(ms: number): Promise<void> {{
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}}
+
+function scheduleHookFlush(): void {{
+  if (hookFlushTimer) return;
+  hookFlushTimer = setTimeout(() => {{
+    hookFlushTimer = undefined;
+    void requestHookDrain();
+  }}, HOOK_FLUSH_INTERVAL_MS);
+  hookFlushTimer.unref?.();
+}}
+
+function requestHookDrain(): Promise<void> {{
+  if (!hookDrainPromise) {{
+    hookDrainPromise = drainHookQueue().finally(() => {{
+      hookDrainPromise = undefined;
+      if (hookQueue.length > 0) void requestHookDrain();
+    }});
+  }}
+  return hookDrainPromise;
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([requestHookDrain(), disposeDrainTimeout()]);
+}}
+
+function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
+  if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
+  hookQueue.push({{ event, url, payload }});
+  if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
+    void requestHookDrain();
+  }} else {{
+    scheduleHookFlush();
+  }}
+}}
+
+async function drainHookQueue(): Promise<void> {{
+  if (hookDraining) return;
+  hookDraining = true;
+  if (hookFlushTimer) {{
+    clearTimeout(hookFlushTimer);
+    hookFlushTimer = undefined;
+  }}
+  try {{
+    while (hookQueue.length > 0) {{
+      const item = hookQueue.shift();
+      if (!item) break;
+      try {{
+        await fetch(item.url, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json", ...authHeaders() }},
+          body: JSON.stringify(item.payload),
+          signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS),
+        }}).catch(() => undefined);
+      }} catch (_e) {{
+        // Best-effort capture. Hooks must never block the agent.
+      }}
+      if (hookQueue.length > 0) await sleep(HOOK_INTER_REQUEST_DELAY_MS);
+    }}
+  }} finally {{
+    hookDraining = false;
+  }}
 }}
 
 function findMarker(cwd: string | undefined): string | undefined {{
@@ -1190,6 +1334,15 @@ function startSession(id: string | undefined, cwd: string, extra: Record<string,
   postHook("session-start", {{ sessionID: id, cwd, ...extra }});
 }}
 
+function endSession(id: string | undefined, directory: string, cwd?: string): void {{
+  if (!id || !startedSessions.delete(id)) return;
+  const resolvedCwd = cwd || cwdFor(id, directory);
+  postHook("session-end", {{ sessionID: id, cwd: resolvedCwd }});
+  sessionCwds.delete(id);
+  handoffChecked.delete(id);
+  preCompactLast.delete(id);
+}}
+
 function postPreCompact(id: string | undefined, directory: string): void {{
   startSession(id, cwdFor(id, directory));
   const key = id || "unknown";
@@ -1206,14 +1359,9 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
   try {{
-    void fetch(url, {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/json", ...authHeaders() }},
-      body: JSON.stringify(payload),
-      signal: timeoutSignal(500),
-    }}).catch(() => undefined);
+    enqueueHook(event, url, payload);
   }} catch (_e) {{
-    // Fire-and-forget. Hooks must never block the agent.
+    // Best-effort capture. Hooks must never block the agent.
   }}
 }}
 
@@ -1236,6 +1384,12 @@ async function fetchHandoff(cwd: string): Promise<string | undefined> {{
 
 export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
   return {{
+    dispose: async () => {{
+      for (const id of Array.from(startedSessions)) {{
+        endSession(id, directory);
+      }}
+      await drainHookQueueForDispose();
+    }},
     event: async (input) => {{
       const event = (input as any).event;
       const properties = event?.properties ?? {{}};
@@ -1252,6 +1406,11 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         const id = properties.sessionID;
         startSession(id, cwdFor(id, directory));
         postHook("stop", {{ sessionID: id, cwd: cwdFor(id, directory) }});
+      }}
+      if (event?.type === "session.deleted") {{
+        const info = properties.info ?? {{}};
+        const id = properties.sessionID ?? info.id;
+        endSession(id, directory, info.directory);
       }}
       if (event?.type === "session.compacted") {{
         const id = properties.sessionID;
@@ -1377,6 +1536,171 @@ fn resolve_omp_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
     omp_extension_path()
 }
 
+fn apply_to_pi_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = resolve_pi_extension_path(args)?;
+    let strategy = args.project_strategy.baked();
+    let body = build_pi_extension(server_url, auth_token, strategy);
+
+    let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new Pi extension file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    if !matches!(outcome, ApplyOutcome::NoOp) {
+        println!();
+        println!("Pi loads TypeScript extensions from ~/.pi/agent/extensions/ on next start.");
+        println!("Restart Pi for lifecycle capture and MCP tools to take effect.");
+    }
+    Ok(())
+}
+
+fn render_pi_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    println!("// Pi extension — write to ~/.pi/agent/extensions/ai-memory.ts");
+    println!("// Or re-run with `--apply` to install it automatically.");
+    println!("// Restart Pi after changing extensions; MCP tools are bridged by this file.");
+    println!();
+    println!(
+        "{}",
+        build_pi_extension(server_url, auth_token, project_strategy)
+    );
+    Ok(())
+}
+
+fn resolve_pi_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
+    if let Some(p) = &args.config_file {
+        return Ok(p.clone());
+    }
+    pi_extension_path()
+}
+
+fn build_pi_extension(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+) -> String {
+    let lifecycle = build_omp_extension(server_url, auth_token, project_strategy)
+        .replace("install-hooks --agent omp --apply", "install-hooks --agent pi --apply")
+        .replace("const AGENT = \"omp\";", "const AGENT = \"pi\";")
+        .replace(
+            r#"
+  api.on("session.compacting", (_event: any, ctx: any) => {
+    postPreCompact(ctx);
+  });
+"#,
+            "\n",
+        )
+        .replace(
+            "export default function AiMemoryExtension(api: any): void {",
+            &format!(
+                "{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
+                pi_mcp_bridge_source()
+            ),
+        )
+        .replace("api.on(\"", "pi.on(\"");
+    debug_assert!(!lifecycle.contains(".omp"));
+    lifecycle
+}
+
+fn pi_mcp_bridge_source() -> &'static str {
+    r#"
+// ---- MCP bridge ------------------------------------------------------------
+const MCP_SERVER = deriveMcpServer(SERVER);
+const MCP_REQUEST_TIMEOUT_MS = 10000;
+let mcpRequestId = 0;
+
+function deriveMcpServer(server: string): string {
+  const trimmed = server.replace(/\/+$/, "");
+  return trimmed.endsWith("/mcp") ? trimmed : `${trimmed}/mcp`;
+}
+
+function mcpSessionId(ctx: any): string | undefined {
+  const id = sessionID(ctx) ?? ctx?.sessionId ?? ctx?.sessionID ?? ctx?.session?.id;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+function mcpSignal(signal?: AbortSignal): AbortSignal | undefined {
+  const timeout = timeoutSignal(MCP_REQUEST_TIMEOUT_MS);
+  if (!signal) return timeout;
+  if (!timeout) return signal;
+  const anyFactory = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  return anyFactory ? anyFactory([signal, timeout]) : timeout;
+}
+
+async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
+  const id = ++mcpRequestId;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    ...authHeaders(),
+  };
+  const session = mcpSessionId(ctx);
+  if (session) {
+    headers["X-Memory-Actor-Session-Id"] = session;
+    headers["Mcp-Session-Id"] = session;
+  }
+  const response = await fetch(MCP_SERVER, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
+    signal: mcpSignal(signal),
+  });
+  if (!response.ok) throw new Error(`ai-memory MCP ${method} failed: HTTP ${response.status}`);
+  const payload = await response.json();
+  if (payload?.error) throw new Error(`ai-memory MCP ${method} failed: ${payload.error.message ?? JSON.stringify(payload.error)}`);
+  if (payload?.result?.isError) throw new Error(`ai-memory MCP ${method} returned isError`);
+  return payload?.result;
+}
+
+function toolInputSchema(tool: any): any {
+  return tool?.inputSchema ?? { type: "object", additionalProperties: true };
+}
+
+async function bootstrapMcpBridge(pi: any): Promise<void> {
+  try {
+    await mcpRpc("initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "ai-memory-pi-extension", version: "0.0.0" },
+    });
+    try { await mcpRpc("notifications/initialized"); } catch (_e) {}
+    const listed = await mcpRpc("tools/list");
+    for (const tool of listed?.tools ?? []) {
+      try {
+        pi.registerTool({
+          name: tool.name,
+          label: tool.name,
+          description: tool.description,
+          parameters: toolInputSchema(tool),
+          execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: any) => {
+            const result = await mcpRpc("tools/call", { name: tool.name, arguments: params ?? {} }, ctx, signal);
+            return { content: result?.content ?? [], details: result };
+          },
+        });
+      } catch (_e) {
+        // Duplicate registration or tool-shape mismatch must not break lifecycle capture.
+      }
+    }
+  } catch (_e) {
+    // MCP bridge is best-effort; extension load and lifecycle capture must survive.
+  }
+}
+"#
+}
+
 fn build_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
@@ -1409,6 +1733,70 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 
 function authHeaders(): Record<string, string> {{
   return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+}}
+
+const HOOK_QUEUE_MAX = 100;
+const HOOK_FLUSH_INTERVAL_MS = 2000;
+const HOOK_FLUSH_THRESHOLD = 20;
+const HOOK_INTER_REQUEST_DELAY_MS = 50;
+const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
+
+type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
+const hookQueue: HookQueueItem[] = [];
+let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
+let hookDraining = false;
+
+function sleep(ms: number): Promise<void> {{
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}}
+
+function scheduleHookFlush(): void {{
+  if (hookFlushTimer) return;
+  hookFlushTimer = setTimeout(() => {{
+    hookFlushTimer = undefined;
+    void drainHookQueue();
+  }}, HOOK_FLUSH_INTERVAL_MS);
+  hookFlushTimer.unref?.();
+}}
+
+function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
+  if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
+  hookQueue.push({{ event, url, payload }});
+  if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
+    void drainHookQueue();
+  }} else {{
+    scheduleHookFlush();
+  }}
+}}
+
+async function drainHookQueue(): Promise<void> {{
+  if (hookDraining) return;
+  hookDraining = true;
+  if (hookFlushTimer) {{
+    clearTimeout(hookFlushTimer);
+    hookFlushTimer = undefined;
+  }}
+  try {{
+    while (hookQueue.length > 0) {{
+      const item = hookQueue.shift();
+      if (!item) break;
+      try {{
+        await fetch(item.url, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json", ...authHeaders() }},
+          body: JSON.stringify(item.payload),
+          signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS),
+        }}).catch(() => undefined);
+      }} catch (_e) {{
+        // Best-effort capture. Hooks must never block the agent.
+      }}
+      if (hookQueue.length > 0) await sleep(HOOK_INTER_REQUEST_DELAY_MS);
+    }}
+  }} finally {{
+    hookDraining = false;
+    if (hookQueue.length > 0) void drainHookQueue();
+  }}
 }}
 
 function findMarker(cwd: string | undefined): string | undefined {{
@@ -1526,14 +1914,9 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("agent", AGENT);
   applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined);
   try {{
-    void fetch(url, {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/json", ...authHeaders() }},
-      body: JSON.stringify(payload),
-      signal: timeoutSignal(500),
-    }}).catch(() => undefined);
+    enqueueHook(event, url, payload);
   }} catch (_e) {{
-    // Fire-and-forget. Hooks must never block the agent.
+    // Best-effort capture. Hooks must never block the agent.
   }}
 }}
 
@@ -1609,6 +1992,10 @@ export default function AiMemoryExtension(api: any): void {{
     postPreCompact(ctx);
   }});
 
+  api.on("session_compact", (_event: any, ctx: any) => {{
+    postPreCompact(ctx);
+  }});
+
   api.on("session.compacting", (_event: any, ctx: any) => {{
     postPreCompact(ctx);
   }});
@@ -1635,10 +2022,18 @@ fn render_agent(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    event_lists: &[&[(&str, &str)]],
 ) -> Result<()> {
     print!(
         "{}",
-        render_agent_output(label, hooks_dir, server_url, auth_token, project_strategy)?
+        render_agent_output(
+            label,
+            hooks_dir,
+            server_url,
+            auth_token,
+            project_strategy,
+            event_lists,
+        )
     );
     Ok(())
 }
@@ -1649,7 +2044,8 @@ fn render_agent_output(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
-) -> Result<String> {
+    event_lists: &[&[(&str, &str)]],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# {label} hook scripts (manual install — wire each to the matching event)\n"
@@ -1665,11 +2061,13 @@ fn render_agent_output(
         out.push_str("#       --auth-token here AND set AI_MEMORY_AUTH_TOKEN on the server.\n");
     }
     out.push('\n');
-    for entry in std::fs::read_dir(hooks_dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.is_file() && p.extension().is_some_and(|e| e == hook_script_extension()) {
-            out.push_str(&format!("- {}\n", p.display()));
+    for events in event_lists {
+        for (_, script) in *events {
+            let script = hook_script_for_current_platform(script);
+            out.push_str(&format!(
+                "- {}\n",
+                hooks_dir.join(script.as_ref()).display()
+            ));
         }
     }
     out.push('\n');
@@ -1678,7 +2076,7 @@ fn render_agent_output(
         out.push_str(&instruction);
         out.push('\n');
     }
-    Ok(out)
+    out
 }
 
 fn manual_agent_project_strategy_instruction(project_strategy: Option<&str>) -> Option<String> {
@@ -1877,14 +2275,6 @@ fn staged_command_dir(staged: &Path, agent_label: &str) -> PathBuf {
     }
 }
 
-fn hook_script_extension() -> &'static str {
-    if hook_script_for_current_platform("x.sh").ends_with(".ps1") {
-        "ps1"
-    } else {
-        "sh"
-    }
-}
-
 fn is_hook_script_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|s| s.to_str()),
@@ -1893,16 +2283,8 @@ fn is_hook_script_file(path: &Path) -> bool {
 }
 
 fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<PathBuf> {
-    let sub = match agent {
-        AgentChoice::ClaudeCode => "claude-code",
-        AgentChoice::Codex => "codex",
-        AgentChoice::Cursor => "cursor",
-        AgentChoice::GeminiCli => "gemini-cli",
-        AgentChoice::AntigravityCli => "antigravity-cli",
-        AgentChoice::Grok => "grok",
-        AgentChoice::OpenCode | AgentChoice::Omp | AgentChoice::Openclaw => {
-            anyhow::bail!("{agent:?} uses a generated integration, not a hook script directory")
-        }
+    let Some(sub) = agent.script_hook_subdir() else {
+        anyhow::bail!("{agent:?} uses a generated integration, not a hook script directory")
     };
     if let Some(p) = explicit {
         let path = p.join(sub);
@@ -2074,9 +2456,38 @@ mod tests {
     use crate::cli::ProjectStrategyArg;
     use std::collections::BTreeMap;
     use std::fs;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn bash_program_for_installer_test() -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from("bash"))
+    }
+
+    #[cfg(windows)]
+    fn bash_program_for_installer_test() -> Option<std::path::PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(root) = std::env::var_os("EXEPATH") {
+            let root = std::path::PathBuf::from(root);
+            candidates.push(root.join("bin").join("bash.exe"));
+            candidates.push(root.join("usr").join("bin").join("bash.exe"));
+        }
+        for env_key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Some(root) = std::env::var_os(env_key) {
+                let root = std::path::PathBuf::from(root).join("Git");
+                candidates.push(root.join("bin").join("bash.exe"));
+                candidates.push(root.join("usr").join("bin").join("bash.exe"));
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        let found = candidates.into_iter().find(|candidate| candidate.is_file());
+        if found.is_none() {
+            eprintln!("skipping installer shell contract: Git for Windows bash.exe was not found");
+        }
+        found
+    }
 
     #[test]
     fn overlay_event_hooks_preserves_third_party_and_replaces_own() {
@@ -2154,9 +2565,19 @@ mod tests {
         assert!(is_ai_memory_hook_entry(&serde_json::json!(
             { "type": "command", "command": "bash -c 'AI_MEMORY_HOOK_URL=x /c/x/ai-memory/hooks/pre.sh'" }
         )));
+        // Claude Code exec form
+        assert!(is_ai_memory_hook_entry(&serde_json::json!(
+            { "matcher": "", "hooks": [ { "type": "command", "command": "C:\\bin\\ai-memory.exe", "args": ["hook", "--event", "session-start", "--agent", "claude-code", "--server-url", "http://h"] } ] }
+        )));
         // Third-party must NOT be flagged
         assert!(!is_ai_memory_hook_entry(&serde_json::json!(
             { "hooks": [ { "type": "command", "command": "node context-mode-cache-heal.mjs" } ] }
+        )));
+        assert!(!is_ai_memory_hook_entry(&serde_json::json!(
+            { "hooks": [ { "type": "command", "command": "C:\\bin\\third-party.exe", "args": ["hook", "--event", "session-start", "--agent", "claude-code", "--server-url", "http://h"] } ] }
+        )));
+        assert!(!is_ai_memory_hook_entry(&serde_json::json!(
+            { "hooks": [ { "type": "command", "command": "C:\\bin\\ai-memory-helper.exe", "args": ["--check", "project"] } ] }
         )));
     }
 
@@ -2239,8 +2660,8 @@ mod tests {
                 "http://127.0.0.1:49374",
                 None,
                 Some("repo-root"),
-            )
-            .unwrap_or_else(|err| panic!("failed to render {agent}: {err}"));
+                &[CODEX_PROFILE.events],
+            );
             assert!(
                 output.contains("AI_MEMORY_PROJECT_STRATEGY=repo-root"),
                 "{agent} manual output must tell users to set the strategy env: {output}"
@@ -2252,10 +2673,62 @@ mod tests {
     fn manual_agent_render_omits_project_strategy_by_default() {
         let temp = TempDir::new().unwrap();
         stub_scripts(temp.path(), &["session-start.sh"]);
-        let output =
-            render_agent_output("codex", temp.path(), "http://127.0.0.1:49374", None, None)
-                .unwrap();
+        let output = render_agent_output(
+            "codex",
+            temp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            &[CODEX_PROFILE.events],
+        );
         assert!(!output.contains("AI_MEMORY_PROJECT_STRATEGY"));
+    }
+
+    #[test]
+    fn manual_agent_render_uses_agent_profile_not_physical_bundle_listing() {
+        let temp = TempDir::new().unwrap();
+        stub_scripts(
+            temp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "stop.sh",
+                "subagent-start.sh",
+                "subagent-stop.sh",
+            ],
+        );
+
+        let gemini = render_agent_output(
+            "gemini-cli",
+            temp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            &[GEMINI_PROFILE.events],
+        );
+        assert!(gemini.contains("session-start"));
+        assert!(gemini.contains("session-end"));
+        assert!(
+            !gemini.contains("user-prompt-submit")
+                && !gemini.contains("subagent-start")
+                && !gemini.contains("subagent-stop"),
+            "Gemini manual output must omit scripts outside Gemini's hook vocabulary: {gemini}"
+        );
+
+        let codex = render_agent_output(
+            "codex",
+            temp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            &[CODEX_PROFILE.events],
+        );
+        assert!(codex.contains("stop"));
+        assert!(
+            !codex.contains("session-end") && !codex.contains("subagent-start"),
+            "Codex manual output must omit scripts outside Codex's hook vocabulary: {codex}"
+        );
     }
 
     #[test]
@@ -2469,6 +2942,7 @@ model = "gpt-5"
             "codex",
             "cursor",
             "gemini-cli",
+            "grok",
             "opencode",
             "antigravity-cli",
         ] {
@@ -2749,6 +3223,34 @@ model = "gpt-5"
     // OpenCode tests
     // ----------------------------------------------------------------
 
+    fn assert_generated_ts_uses_bounded_hook_queue(generated: &str) {
+        assert!(generated.contains("const HOOK_QUEUE_MAX = 100;"));
+        assert!(generated.contains("const HOOK_FLUSH_INTERVAL_MS = 2000;"));
+        assert!(generated.contains("const HOOK_FLUSH_THRESHOLD = 20;"));
+        assert!(generated.contains("const HOOK_INTER_REQUEST_DELAY_MS = 50;"));
+        assert!(generated.contains("const HOOK_REQUEST_TIMEOUT_MS = 2000;"));
+        assert!(generated.contains("const HOOK_IMMEDIATE_EVENTS = new Set([\"session-start\", \"stop\", \"session-end\", \"pre-compact\"]);"));
+        assert!(generated.contains("const hookQueue: HookQueueItem[] = [];"));
+        assert!(generated.contains(
+            "function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void"
+        ));
+        assert!(generated.contains("if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();"));
+        assert!(generated.contains(
+            "HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD"
+        ));
+        assert!(generated.contains("function scheduleHookFlush(): void"));
+        assert!(generated.contains("hookFlushTimer.unref?.();"));
+        assert!(generated.contains("async function drainHookQueue(): Promise<void>"));
+        assert!(generated.contains("signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS)"));
+        assert!(generated.contains("await sleep(HOOK_INTER_REQUEST_DELAY_MS)"));
+        assert!(generated.contains("enqueueHook(event, url, payload);"));
+        assert!(generated.contains("async function fetchHandoff"));
+        assert!(generated.contains("const response = await fetch(url, {"));
+        assert!(generated.contains("signal: timeoutSignal(1000)"));
+        assert!(!generated.contains("signal: timeoutSignal(500)"));
+        assert!(!generated.contains("void fetch(url, {"));
+    }
+
     #[test]
     fn opencode_plugin_uses_real_plugin_hooks() {
         let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
@@ -2761,18 +3263,40 @@ model = "gpt-5"
         assert!(plugin.contains("export default AiMemoryHooks"));
         assert!(plugin.contains("const startedSessions = new Set<string>();"));
         assert!(plugin.contains("function startSession"));
+        assert!(plugin.contains("function endSession"));
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
         assert!(plugin.contains("text.split(/\\r?\\n/)"));
         assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
+        assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"project_strategy\", projectStrategy)"));
+        assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
         assert!(plugin.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
         assert!(plugin.contains("applyMarkerParams(url, cwd);"));
         assert!(plugin.contains("postPreCompact"));
+        assert!(plugin.contains("dispose: async () =>"));
+        assert!(plugin.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(plugin.contains("let hookDrainPromise: Promise<void> | undefined;"));
+        assert!(plugin.contains("function requestHookDrain(): Promise<void>"));
+        assert!(plugin.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(plugin.contains("timer.unref?.();"));
+        assert!(plugin.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(plugin.contains("for (const id of Array.from(startedSessions))"));
+        assert!(plugin.contains("await drainHookQueueForDispose();"));
         assert!(plugin.contains("postHook(\"session-start\""));
+        assert!(plugin.contains(r#""session.deleted")"#));
+        assert_eq!(
+            plugin.matches("postHook(\"session-end\"").count(),
+            1,
+            "OpenCode generated plugin must route session closes through one idempotent helper"
+        );
+        assert!(plugin.contains("!startedSessions.delete(id)"));
+        assert!(plugin.contains("sessionCwds.delete(id);"));
+        assert!(plugin.contains("handoffChecked.delete(id);"));
+        assert!(plugin.contains("preCompactLast.delete(id);"));
         assert!(plugin.contains("postHook(\"user-prompt\""));
         assert!(plugin.contains("Bearer ${TOKEN}"));
         assert!(plugin.contains("tok"));
@@ -2835,6 +3359,13 @@ model = "gpt-5"
         );
     }
 
+    #[test]
+    fn opencode_plugin_uses_bounded_hook_queue() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+
+        assert_generated_ts_uses_bounded_hook_queue(&plugin);
+    }
+
     // ----------------------------------------------------------------
     // OMP tests
     // ----------------------------------------------------------------
@@ -2857,7 +3388,9 @@ model = "gpt-5"
         assert!(extension.contains("readFileSync(marker, \"utf8\")"));
         assert!(extension.contains("text.split(/\\r?\\n/)"));
         assert!(extension.contains("tomlKey(body, \"project_strategy\")"));
+        assert!(extension.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(extension.contains("url.searchParams.set(\"project_strategy\", projectStrategy)"));
+        assert!(extension.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
         assert!(extension.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -2901,6 +3434,13 @@ model = "gpt-5"
     }
 
     #[test]
+    fn omp_extension_uses_bounded_hook_queue() {
+        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+
+        assert_generated_ts_uses_bounded_hook_queue(&extension);
+    }
+
+    #[test]
     fn omp_extension_is_directly_discoverable_by_omp() {
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
@@ -2927,7 +3467,97 @@ model = "gpt-5"
         );
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn pi_extension_is_directly_discoverable_by_pi() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extensions").join("ai-memory.ts");
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Pi,
+            hooks_dir: None,
+            server_url: "http://127.0.0.1:49374".into(),
+            auth_token: None,
+            as_user: None,
+            apply: true,
+            config_file: Some(path.clone()),
+            project_strategy: ProjectStrategyArg::Basename,
+        };
+
+        let resolved = resolve_pi_extension_path(&args).unwrap();
+
+        assert_eq!(resolved, path);
+        assert_eq!(
+            resolved.file_name().and_then(|s| s.to_str()),
+            Some("ai-memory.ts")
+        );
+        assert_eq!(
+            resolved
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("extensions")
+        );
+    }
+
+    #[test]
+    fn pi_extension_contains_lifecycle_capture_and_mcp_bridge() {
+        let extension = build_pi_extension("http://127.0.0.1:49374/base", Some("tok"), None);
+
+        assert!(extension.contains("export default function AiMemoryExtension(pi: any): void"));
+        assert!(extension.contains("const AGENT = \"pi\";"));
+        assert!(extension.contains("pi.on(\"session_start\""));
+        assert!(extension.contains("pi.on(\"before_agent_start\""));
+        assert!(extension.contains("pi.on(\"tool_call\""));
+        assert!(extension.contains("pi.on(\"tool_result\""));
+        assert!(extension.contains("pi.on(\"session_before_compact\""));
+        assert!(extension.contains("pi.on(\"session_compact\""));
+        assert!(!extension.contains("pi.on(\"session.compacting\""));
+        assert!(extension.contains("pi.on(\"agent_end\""));
+        assert!(extension.contains("pi.on(\"session_shutdown\""));
+        assert!(extension.contains("postHook(\"session-start\""));
+        assert!(extension.contains("postHook(\"user-prompt\""));
+        assert!(extension.contains("postHook(\"pre-tool-use\""));
+        assert!(extension.contains("postHook(\"post-tool-use\""));
+        assert!(extension.contains("postHook(\"pre-compact\""));
+        assert!(extension.contains("postHook(\"stop\""));
+        assert!(extension.contains("postHook(\"session-end\""));
+        assert!(extension.contains("fetchHandoff"));
+        assert!(extension.contains("customType: \"ai-memory-handoff\""));
+        assert!(extension.contains("const MCP_SERVER = deriveMcpServer(SERVER);"));
+        assert!(
+            extension.contains("return trimmed.endsWith(\"/mcp\") ? trimmed : `${trimmed}/mcp`;")
+        );
+        assert!(extension.contains("\"Accept\": \"application/json, text/event-stream\""));
+        assert!(extension.contains("...authHeaders()"));
+        assert!(extension.contains("headers[\"X-Memory-Actor-Session-Id\"] = session;"));
+        assert!(extension.contains("headers[\"Mcp-Session-Id\"] = session;"));
+        assert!(extension.contains("function mcpSignal(signal?: AbortSignal)"));
+        assert!(extension.contains("anyFactory([signal, timeout])"));
+        assert!(extension.contains("mcpRpc(\"initialize\""));
+        assert!(extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains("mcpRpc(\"tools/list\""));
+        assert!(extension.contains("pi.registerTool"));
+        assert!(extension.contains("label: tool.name"));
+        assert!(extension.contains("parameters: toolInputSchema(tool)"));
+        assert!(extension.contains(
+            "mcpRpc(\"tools/call\", { name: tool.name, arguments: params ?? {} }, ctx, signal)"
+        ));
+        assert!(extension.contains("payload?.error"));
+        assert!(extension.contains("payload?.result?.isError"));
+        assert!(extension.contains("response.ok"));
+        assert!(extension.contains("signal: mcpSignal(signal)"));
+        assert!(extension.contains("Bearer ${TOKEN}"));
+        assert!(extension.contains("tok"));
+        assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
+        assert!(!extension.contains(".omp"));
+        assert!(!extension.contains("serve --transport stdio"));
+        assert!(!extension.contains("serve --stdio"));
+    }
+
+    // Windows 11 + Git Bash support matters for regulated enterprise setups
+    // where Git Bash is the approved shell available from the corporate
+    // repository, so this installer contract should be exercised anywhere
+    // Bash is the supported execution surface.
+    #[cfg(any(unix, windows))]
     #[test]
     fn curl_installer_accepts_generated_integration_agents() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2935,9 +3565,12 @@ model = "gpt-5"
             .join("..")
             .join("scripts")
             .join("install-hooks.sh");
+        let Some(bash) = bash_program_for_installer_test() else {
+            return;
+        };
 
-        for alias in ["opencode", "openclaw", "pi", "oh-my-pi"] {
-            let output = Command::new("bash")
+        for alias in ["opencode", "openclaw", "omp", "oh-my-pi", "pi"] {
+            let output = Command::new(&bash)
                 .arg(&script)
                 .arg("--agent")
                 .arg(alias)
@@ -2957,9 +3590,15 @@ model = "gpt-5"
             match alias {
                 "opencode" => assert!(stdout.contains("install-hooks --agent opencode --apply")),
                 "openclaw" => assert!(stdout.contains("install-hooks --agent openclaw --apply")),
-                "pi" | "oh-my-pi" => {
+                "omp" | "oh-my-pi" => {
                     assert!(stdout.contains("install-hooks --agent omp --apply"));
                     assert!(stdout.contains("~/.omp/agent/extensions/ai-memory.ts"));
+                }
+                "pi" => {
+                    assert!(stdout.contains("install-hooks --agent pi --apply"));
+                    assert!(stdout.contains("~/.pi/agent/extensions/ai-memory.ts"));
+                    assert!(stdout.contains("MCP tools come through the same generated bridge"));
+                    assert!(!stdout.contains("~/.omp/agent/extensions/ai-memory.ts"));
                 }
                 _ => unreachable!(),
             }
@@ -3112,6 +3751,10 @@ model = "gpt-5"
         assert!(
             parsed["hooks"]["SessionStart"].is_array(),
             "SessionStart hook should be present"
+        );
+        assert!(
+            parsed["hooks"].get("SessionEnd").is_none(),
+            "Codex has no reliable true SessionEnd hook; install must omit it"
         );
     }
 

@@ -4,9 +4,11 @@
 //! `setup-agent`) all emit configuration snippets that share two
 //! pieces of state:
 //!
-//! 1. The seven Claude Code lifecycle-hook events ai-memory wires
-//!    up — kept in sync between hook-bundle generation (setup-agent)
-//!    and JSON-config rendering (install-hooks).
+//! 1. The per-agent lifecycle-hook event lists ai-memory wires up
+//!    (Claude/Grok share `CLAUDE_CODE_EVENTS`; Codex, Cursor, Gemini,
+//!    and Antigravity define their own profiles) — kept in sync between
+//!    hook-bundle generation (setup-agent) and config rendering
+//!    (install-hooks).
 //! 2. The optional `Authorization: Bearer <token>` header used by
 //!    both MCP client configs (install-mcp) and hook env blocks
 //!    (install-hooks / setup-agent).
@@ -19,18 +21,18 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::commands::path_util::strip_windows_verbatim_prefix;
 
 /// Claude Code lifecycle events ai-memory hooks. Each pair is
 /// `(event-name-in-Claude-Code-settings, POSIX hook-script-filename)`.
 ///
-/// Adding a hook event means updating this list AND adding the
-/// matching `.sh` and `.ps1` files under
-/// `hooks/{claude-code,codex,cursor,gemini-cli,grok,opencode}/`. The
-/// install-hooks parity test fails if the bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
+/// Adding a hook event means updating this list AND adding the matching `.sh`
+/// and `.ps1` files under the agents that use this profile (`claude-code` and
+/// `grok`). Agents with different vocabularies keep their own event arrays
+/// below. The install-hooks parity test fails if a bundle drifts.
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -38,6 +40,11 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
+    // Subagent boundaries — let the server seed/forget a subagent session id so
+    // `drop_subagent_captures` can drop the whole nested session (Claude Code +
+    // grok both emit these; other agents keep their own event lists).
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
 ];
 
 /// Format an `Authorization: Bearer <token>` header value, or `None`
@@ -77,7 +84,7 @@ pub(crate) fn ts_string_literal(s: &str) -> String {
 }
 
 /// Build the Claude Code `settings.json` fragment that wires the
-/// seven hooks. Used by both:
+/// lifecycle hooks (`CLAUDE_CODE_EVENTS`). Used by both:
 /// - `install-hooks --agent claude-code` (script paths are
 ///   wherever the user told us via `--hooks-dir`)
 /// - `setup-agent --agent claude-code` (script paths are where
@@ -132,7 +139,8 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
             "claude-code",
             data_dir,
             project_strategy,
-        ),
+        )
+        .allow_claude_windows_exec(),
     )
 }
 
@@ -334,20 +342,17 @@ fn build_antigravity_payload_for_platform(
     for (event, script) in &ANTIGRAVITY_TOOL_EVENTS {
         let s = script_for_platform(script, platform);
         let abs = emit_root.join(s.as_ref());
-        let command = hook_command(
+        let handler = hook_handler_value(HookHandlerSpec::ShellString(hook_command(
             &abs,
             server_url,
             auth_token,
             HookCommandContext::new(platform, agent, data_dir, project_strategy),
-        );
+        )));
         group.insert(
             (*event).to_string(),
             json!([{
                 "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": command,
-                }],
+                "hooks": [handler],
             }]),
         );
     }
@@ -356,19 +361,13 @@ fn build_antigravity_payload_for_platform(
     for (event, script) in &ANTIGRAVITY_LIFECYCLE_EVENTS {
         let s = script_for_platform(script, platform);
         let abs = emit_root.join(s.as_ref());
-        let command = hook_command(
+        let handler = hook_handler_value(HookHandlerSpec::ShellString(hook_command(
             &abs,
             server_url,
             auth_token,
             HookCommandContext::new(platform, agent, data_dir, project_strategy),
-        );
-        group.insert(
-            (*event).to_string(),
-            json!([{
-                "type": "command",
-                "command": command,
-            }]),
-        );
+        )));
+        group.insert((*event).to_string(), Value::Array(vec![handler]));
     }
 
     json!({ "ai-memory": group })
@@ -464,6 +463,11 @@ struct HookCommandContext<'a> {
     /// Install-time default project strategy baked into the command
     /// (`install-hooks --project-strategy`). `None` bakes nothing.
     project_strategy: Option<&'a str>,
+    /// Whether this render path may use Claude Code's exec-form hook handler.
+    /// Only `install-hooks --agent claude-code` sets this; setup-agent/docker
+    /// snippets keep command-string script fallback even when the platform env
+    /// is overridden to `windows-native`.
+    claude_windows_exec_allowed: bool,
 }
 
 impl<'a> HookCommandContext<'a> {
@@ -478,60 +482,66 @@ impl<'a> HookCommandContext<'a> {
             agent,
             data_dir,
             project_strategy,
+            claude_windows_exec_allowed: false,
         }
+    }
+
+    const fn allow_claude_windows_exec(mut self) -> Self {
+        self.claude_windows_exec_allowed = true;
+        self
     }
 }
 
 impl HookCommandPlatform {
-    fn current() -> Self {
-        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
-            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
-            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
-                Self::Posix
+    /// Parse an explicit `AI_MEMORY_HOOK_PLATFORM` override. `None` when the
+    /// var is unset or names no known platform — callers then apply their own
+    /// per-render-path default. One parser so a new platform value can't be
+    /// recognised by one render path and silently ignored by another.
+    fn from_env_override() -> Option<Self> {
+        let v = std::env::var("AI_MEMORY_HOOK_PLATFORM").ok()?;
+        match v {
+            v if v.eq_ignore_ascii_case("windows") => Some(Self::Windows),
+            v if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
+                Some(Self::Posix)
             }
-            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
-            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
-            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
-            _ if cfg!(windows) => Self::Windows,
-            _ => Self::Posix,
+            v if v.eq_ignore_ascii_case("windows-bash") => Some(Self::WindowsBash),
+            v if v.eq_ignore_ascii_case("windows-native") => Some(Self::WindowsNative),
+            v if v.eq_ignore_ascii_case("posix-native") => Some(Self::PosixNative),
+            _ => None,
         }
     }
 
+    fn current() -> Self {
+        Self::from_env_override().unwrap_or(if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        })
+    }
+
     /// Platform for agents known to use bash as their hook runner on
-    /// Windows (currently Claude Code). Returns `WindowsBash` on
+    /// Windows (currently Claude Code). Returns `WindowsNative` on
     /// Windows unless overridden by `AI_MEMORY_HOOK_PLATFORM`.
     fn for_bash_runner() -> Self {
-        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
-            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
-            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
-                Self::Posix
-            }
-            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
-            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
-            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
-            _ if cfg!(windows) => Self::WindowsNative,
-            // Native macOS / Linux defaults to the binary hook command (spool +
-            // OIDC), same as Windows. The Docker wrapper forces `posix` so its
-            // host-rendered config keeps using the `.sh` scripts.
-            _ => Self::PosixNative,
-        }
+        // Native macOS / Linux defaults to the binary hook command (spool +
+        // OIDC), same as Windows. The Docker wrapper forces `posix` so its
+        // host-rendered config keeps using the `.sh` scripts.
+        Self::from_env_override().unwrap_or(if cfg!(windows) {
+            Self::WindowsNative
+        } else {
+            Self::PosixNative
+        })
     }
 
     /// Script fallback for setup-agent / docker-host snippets. Respects an
     /// explicit override, but defaults to the shell command because setup-agent
     /// copies scripts, not a host-local native binary.
     fn for_bash_script_runner() -> Self {
-        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
-            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
-            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
-                Self::Posix
-            }
-            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
-            Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
-            Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
-            _ if cfg!(windows) => Self::WindowsBash,
-            _ => Self::Posix,
-        }
+        Self::from_env_override().unwrap_or(if cfg!(windows) {
+            Self::WindowsBash
+        } else {
+            Self::Posix
+        })
     }
 }
 
@@ -556,10 +566,12 @@ fn build_hook_payload_for_platform(
         //     }
         //   ]
         //
-        // We INLINE env vars into the command string itself
+        // Shell-form handlers INLINE env vars into the command string itself
         // (`AI_MEMORY_HOOK_URL=... AI_MEMORY_AUTH_TOKEN=... /path`)
-        // rather than passing them through an `env` field on the
-        // hook entry. Reasons:
+        // rather than passing them through an `env` field on the hook entry.
+        // Native Claude Code Windows installs instead use official exec form,
+        // where server/auth/project options are passed as raw argv tokens.
+        // Reasons shell-form handlers keep inline env vars:
         //   1. CC doesn't appear to honour an `env` field at this
         //      level — observed empirically: the hook fires but
         //      the script sees neither var and falls back to the
@@ -571,7 +583,9 @@ fn build_hook_payload_for_platform(
         //      `hooks/claude-code/session-start.sh` etc.), so no
         //      script changes are required on POSIX. Windows uses an
         //      explicit PowerShell command with equivalent env setup.
-        let command = hook_command(&abs, server_url, auth_token, context);
+        let handler = hook_handler_value(hook_handler_spec(
+            &abs, server_url, auth_token, context, shape,
+        ));
 
         // Empty matcher = fire on every event of this kind. Right
         // for ai-memory's capture hooks (every prompt, every tool
@@ -579,20 +593,57 @@ fn build_hook_payload_for_platform(
         let entry = match shape {
             HookShape::Nested => json!([{
                 "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": command,
-                }],
+                "hooks": [handler],
             }]),
-            HookShape::Flat => json!([{
-                "type": "command",
-                "command": command,
-                "matcher": "",
-            }]),
+            HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
         };
         hooks_block.insert((*event).to_string(), entry);
     }
     json!({ "hooks": hooks_block })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HookHandlerSpec {
+    ShellString(String),
+    Exec { command: String, args: Vec<String> },
+}
+
+fn hook_handler_spec(
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+    shape: HookShape,
+) -> HookHandlerSpec {
+    if shape == HookShape::Nested
+        && context.claude_windows_exec_allowed
+        && context.platform == HookCommandPlatform::WindowsNative
+        && context.agent == "claude-code"
+    {
+        return windows_native_exec_spec(script, server_url, auth_token, context);
+    }
+    HookHandlerSpec::ShellString(hook_command(script, server_url, auth_token, context))
+}
+
+fn hook_handler_value(spec: HookHandlerSpec) -> Value {
+    match spec {
+        HookHandlerSpec::ShellString(command) => json!({
+            "type": "command",
+            "command": command,
+        }),
+        HookHandlerSpec::Exec { command, args } => json!({
+            "type": "command",
+            "command": command,
+            "args": args,
+        }),
+    }
+}
+
+fn hook_handler_with_matcher(mut handler: Value) -> Value {
+    if let Some(obj) = handler.as_object_mut() {
+        obj.insert("matcher".to_string(), Value::String(String::new()));
+    }
+    handler
 }
 
 fn script_for_platform(script: &str, platform: HookCommandPlatform) -> Cow<'_, str> {
@@ -665,17 +716,18 @@ fn hook_command(
             format!("bash -c {}", shell_quote(&inner))
         }
         HookCommandPlatform::WindowsNative => {
-            // Invoke the binary directly: `"<exe>" hook --event <e> --agent
-            // claude-code --server-url "<url>" [--auth-token "<t>"]`. The
-            // event token is the script stem (`pre-tool-use.sh` →
-            // `pre-tool-use`). No shell, no child processes.
+            // Legacy/setup-agent/fallback string form: invoke the binary
+            // directly as `"<exe>" hook --event <e> --agent ...`. Primary
+            // Claude Code WindowsNative `install-hooks` uses exec form instead
+            // (see `windows_native_exec_spec`). The event token is the script
+            // stem (`pre-tool-use.sh` → `pre-tool-use`). No shell, no child
+            // processes in the intended runner.
             //
             // Quote with DOUBLE quotes, not POSIX single quotes: Claude Code
-            // on Windows runs the hook command through cmd.exe, which treats
-            // '…' literally and errors out; double quotes + the native
-            // Windows path work in BOTH cmd.exe and Git Bash (verified). The
-            // event name is a fixed slug with no shell metacharacters, so it
-            // is left unquoted.
+            // on Windows shell-form runners may treat '…' literally and error
+            // out; double quotes + the native Windows path work in cmd.exe and
+            // Git Bash. The event name is a fixed slug with no shell
+            // metacharacters, so it is left unquoted.
             let exe = std::env::current_exe()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "ai-memory".to_string());
@@ -728,6 +780,60 @@ fn hook_command(
             cmd
         }
     }
+}
+
+fn windows_native_exec_spec(
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> HookHandlerSpec {
+    let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("ai-memory.exe").to_path_buf());
+    windows_native_exec_spec_with_exe(&exe, script, server_url, auth_token, context)
+}
+
+fn windows_native_exec_spec_with_exe(
+    exe: &Path,
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> HookHandlerSpec {
+    let event = script
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let mut args = Vec::new();
+    if let Some(data_dir) = context.data_dir {
+        args.push("--data-dir".to_string());
+        args.push(plain_windows_path_arg(data_dir));
+    }
+    args.extend([
+        "hook".to_string(),
+        "--event".to_string(),
+        event.to_string(),
+        "--agent".to_string(),
+        context.agent.to_string(),
+        "--server-url".to_string(),
+        server_url.to_string(),
+    ]);
+    if let Some(t) = auth_token {
+        args.push("--auth-token".to_string());
+        args.push(t.to_string());
+    }
+    if let Some(strategy) = context.project_strategy {
+        args.push("--project-strategy".to_string());
+        args.push(strategy.to_string());
+    }
+    HookHandlerSpec::Exec {
+        command: plain_windows_path_arg(exe),
+        args,
+    }
+}
+
+fn plain_windows_path_arg(path: &Path) -> String {
+    let lossy = path.to_string_lossy();
+    strip_windows_verbatim_prefix(&lossy).into_owned()
 }
 
 #[derive(Clone, Copy)]
@@ -841,11 +947,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_payload_has_seven_events() {
+    fn claude_code_payload_has_all_events() {
         let root = PathBuf::from("/host/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
-        assert_eq!(hooks.len(), 7);
+        assert_eq!(hooks.len(), CLAUDE_CODE_EVENTS.len());
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
         }
@@ -885,8 +991,9 @@ mod tests {
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
+        let normalized = command.replace('\\', "/");
         assert!(
-            command.contains("/host/hooks/grok/session-start.sh"),
+            normalized.contains("/host/hooks/grok/session-start.sh"),
             "{command}"
         );
         assert!(!command.contains("claude-code"), "{command}");
@@ -1099,32 +1206,213 @@ mod tests {
                 "claude-code",
                 None,
                 None,
-            ),
+            )
+            .allow_claude_windows_exec(),
         );
-        // Each native command must carry `hook --event <stem>` where <stem>
-        // matches the .sh script the other platforms invoke — so the server
-        // buckets the event identically — and must not spawn a shell.
+        // Each native exec-form handler must carry `hook --event <stem>` in
+        // argv, where <stem> matches the .sh script the other platforms invoke.
         for (event, script) in CLAUDE_CODE_EVENTS {
             let stem = script.strip_suffix(".sh").unwrap();
-            let cmd = v
-                .pointer(&format!("/hooks/{event}/0/hooks/0/command"))
-                .and_then(|s| s.as_str())
-                .unwrap();
+            let handler = v.pointer(&format!("/hooks/{event}/0/hooks/0")).unwrap();
+            let cmd = handler.get("command").and_then(|s| s.as_str()).unwrap();
+            let args: Vec<&str> = handler
+                .get("args")
+                .and_then(|a| a.as_array())
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap())
+                .collect();
+            assert!(!cmd.contains("--event"), "{event}: executable only: {cmd}");
             assert!(
-                cmd.contains(&format!("hook --event {stem}")),
-                "{event}: {cmd}"
+                args.windows(2).any(|w| w == ["--event", stem]),
+                "{event}: {args:?}"
             );
-            assert!(cmd.contains("--agent claude-code"), "{event}: {cmd}");
             assert!(
-                cmd.contains("--server-url \"http://h:49374\""),
-                "{event}: {cmd}"
+                args.windows(2).any(|w| w == ["--agent", "claude-code"]),
+                "{event}: {args:?}"
             );
-            assert!(cmd.contains("--auth-token \"tok\""), "{event}: {cmd}");
             assert!(
-                !cmd.contains("bash -c"),
-                "{event}: must not spawn a shell: {cmd}"
+                args.windows(2)
+                    .any(|w| w == ["--server-url", "http://h:49374"]),
+                "{event}: {args:?}"
+            );
+            assert!(
+                args.windows(2).any(|w| w == ["--auth-token", "tok"]),
+                "{event}: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn windows_native_claude_code_nested_payload_uses_exec_form() {
+        let root = PathBuf::from(r"C:\hooks");
+        let data_dir = Path::new(r"\\?\C:\Users\me\AppData\Local\ai-memory");
+        let v = build_hook_payload_for_platform(
+            &[("SessionStart", "session-start.sh")],
+            &root,
+            "http://h:49374",
+            Some("tok"),
+            HookShape::Nested,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                Some(data_dir),
+                Some("repo-root"),
+            )
+            .allow_claude_windows_exec(),
+        );
+        let handler = v.pointer("/hooks/SessionStart/0/hooks/0").unwrap();
+        let command = handler.get("command").and_then(|v| v.as_str()).unwrap();
+        let args: Vec<&str> = handler
+            .get("args")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        assert!(command.contains("ai-memory") || command.contains("ai_memory"));
+        assert!(
+            !command.contains(" --event "),
+            "command is executable only: {command}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--data-dir",
+                r"C:\Users\me\AppData\Local\ai-memory",
+                "hook",
+                "--event",
+                "session-start",
+                "--agent",
+                "claude-code",
+                "--server-url",
+                "http://h:49374",
+                "--auth-token",
+                "tok",
+                "--project-strategy",
+                "repo-root",
+            ]
+        );
+        assert!(
+            args.iter().all(|arg| !arg.contains('"')),
+            "args are raw argv tokens"
+        );
+    }
+
+    #[test]
+    fn windows_native_exec_spec_strips_verbatim_exe_and_data_dir() {
+        let spec = windows_native_exec_spec_with_exe(
+            Path::new(r"\\?\C:\Program Files\ai-memory\ai-memory.exe"),
+            Path::new(r"C:\hooks\post-tool-use.sh"),
+            "http://h:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                Some(Path::new(r"\\?\C:\Data\ai-memory")),
+                None,
+            ),
+        );
+        let HookHandlerSpec::Exec { command, args } = spec else {
+            panic!("expected exec spec")
+        };
+        assert_eq!(command, r"C:\Program Files\ai-memory\ai-memory.exe");
+        assert_eq!(args[1], r"C:\Data\ai-memory");
+        assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
+    }
+
+    #[test]
+    fn exec_form_is_narrow_to_claude_code_windows_native_nested() {
+        fn handler_for(
+            platform: HookCommandPlatform,
+            agent: &str,
+            shape: HookShape,
+        ) -> serde_json::Value {
+            let v = build_hook_payload_for_platform(
+                &[("SessionStart", "session-start.sh")],
+                Path::new(r"C:\hooks"),
+                "http://h:49374",
+                Some("tok"),
+                shape,
+                HookCommandContext::new(platform, agent, None, None).allow_claude_windows_exec(),
+            );
+            match shape {
+                HookShape::Nested => v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone(),
+                HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
+            }
+        }
+
+        for (platform, agent, shape) in [
+            (
+                HookCommandPlatform::WindowsBash,
+                "claude-code",
+                HookShape::Nested,
+            ),
+            (
+                HookCommandPlatform::Windows,
+                "claude-code",
+                HookShape::Nested,
+            ),
+            (HookCommandPlatform::Posix, "claude-code", HookShape::Nested),
+            (
+                HookCommandPlatform::PosixNative,
+                "claude-code",
+                HookShape::Nested,
+            ),
+            (
+                HookCommandPlatform::WindowsNative,
+                "grok",
+                HookShape::Nested,
+            ),
+            (
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                HookShape::Flat,
+            ),
+        ] {
+            let handler = handler_for(platform, agent, shape);
+            assert!(
+                handler.get("args").is_none(),
+                "{platform:?}/{agent}/{shape:?} must keep command-string form: {handler}"
+            );
+        }
+
+        let setup_like = build_hook_payload_for_platform(
+            &[("SessionStart", "session-start.sh")],
+            Path::new(r"C:\hooks"),
+            "http://h:49374",
+            Some("tok"),
+            HookShape::Nested,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                None,
+                None,
+            ),
+        );
+        assert!(
+            setup_like
+                .pointer("/hooks/SessionStart/0/hooks/0/args")
+                .is_none(),
+            "setup-agent style Claude Code payload must not inherit exec form: {setup_like}"
+        );
+
+        let antigravity = build_antigravity_payload_for_platform(
+            Path::new(r"C:\hooks"),
+            "http://h:49374",
+            Some("tok"),
+            HookCommandPlatform::WindowsNative,
+            "antigravity-cli",
+            None,
+            None,
+        );
+        assert!(
+            antigravity
+                .pointer("/ai-memory/PreInvocation/0/args")
+                .is_none(),
+            "antigravity must not inherit exec form: {antigravity}"
+        );
     }
 
     #[test]

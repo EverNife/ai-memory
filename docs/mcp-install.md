@@ -42,6 +42,12 @@ endpoint. The trade-off:
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
 
+For proactive tool use in MCP-capable clients that read project instructions,
+also install the managed routing package from
+[`docs/usage.md`](usage.md#install-the-routing-snippet-and-agent-skills). The
+slim instruction block stays in the agent rules file, while supported Agent
+Skills carry the detailed ai-memory tool-routing guidance.
+
 ## Custom lifecycle bridges
 
 Built-in integrations should use `ai-memory install-hooks` rather than
@@ -78,7 +84,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / pi|omp / antigravity-cli / vscode-copilot
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / vscode-copilot
 > ```
 
 ---
@@ -430,18 +436,17 @@ OpenClaw distinguishes transports explicitly. Use
 
 ## Oh My Pi / OMP
 
-**Status:** ✅ MCP supported via `install-mcp --client pi` or
-`--client omp`. ✅ Lifecycle capture supported via
-`ai-memory install-hooks --agent omp --apply` or `--agent pi --apply`.
+**Status:** ✅ MCP supported via `install-mcp --client omp` (or
+`--client oh-my-pi`). ✅ Lifecycle capture supported via
+`ai-memory install-hooks --agent omp --apply` (or `--agent oh-my-pi`).
 
 **Config file:**
 - User: `~/.omp/agent/mcp.json`
 - Project: `.omp/mcp.json`
 
 The current Oh My Pi package exposes the `omp` binary and native
-`.omp` config directories. The ai-memory CLI accepts `--client pi` /
-`--client omp` for MCP and `--agent omp` / `--agent pi` for lifecycle
-capture; they are aliases for this same integration surface.
+`.omp` config directories. Use `omp` (or `oh-my-pi`) for this integration;
+real `pi` is recognized separately and uses the generated bridge extension below.
 
 ```json
 {
@@ -459,8 +464,7 @@ capture; they are aliases for this same integration surface.
 
 ```bash
 ai-memory install-hooks --agent omp --apply
-# or:
-ai-memory install-hooks --agent pi --apply
+# or: ai-memory install-hooks --agent oh-my-pi --apply
 ```
 
 This writes `~/.omp/agent/extensions/ai-memory.ts`, which OMP discovers
@@ -472,6 +476,25 @@ installing or changing the file.
   used for context injection.
 - The extension uses OMP lifecycle events for prompt/tool capture and
   `before_agent_start` to inject pending ai-memory handoffs.
+
+## Pi
+
+**Status:** ✅ MCP and lifecycle capture supported via generated bridge
+extension. Pi has no native `mcp.json`; use `install-hooks --agent pi --apply`
+to write `~/.pi/agent/extensions/ai-memory.ts`.
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+The generated extension posts lifecycle events to `/hook`, fetches pending
+handoffs in `before_agent_start`, initializes ai-memory's HTTP `/mcp` endpoint,
+lists tools, and registers each one with `pi.registerTool`. `install-mcp
+--client pi` intentionally prints this bridge guidance instead of writing an
+ignored `~/.pi/agent/mcp.json`.
+
+OMP / Oh My Pi remains separate: use `--client omp` / `--agent omp` (or
+`oh-my-pi`) for `.omp` paths.
 
 ---
 
@@ -492,6 +515,14 @@ Model (any client): I can call: memory_query, memory_recent,
      memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
 ```
+
+If the model sees the tools but does not call them proactively, refresh the
+managed routing package. The `memory_install_self_routing` tool is read-only:
+it returns the slim markered instruction block, marker strings, agent filename
+hints, managed skill payloads (`name`, `description`, `relative_path`,
+`content`), project/global target hints for `.claude/skills` and
+`.agents/skills`, and overwrite guidance. Agents should use their own file
+editing tools to write those artifacts while preserving unrelated user content.
 
 If the model doesn't see any of those tools, the MCP registration
 isn't being picked up. Check:
@@ -522,8 +553,20 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code, Cursor, Gemini CLI, Grok Build CLI, OpenClaw, and OMP. Codex, OpenCode, and Antigravity CLI have no true session-end event in the current integration, so ask them to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the routing snippet](usage.md#install-the-routing-snippet). |
+| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Cursor, Gemini CLI, Grok Build CLI, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI / OpenClaw / OpenCode / OMP. Grok is explicitly excluded because it ignores SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+
+OpenCode uses its official `session.deleted` plugin event for true session-end
+delivery. Its generated plugin also sends a deduped best-effort close for any
+still-active sessions from `dispose` during normal plugin teardown; abrupt
+process exits can still lose that fallback, so `session.deleted` remains the
+primary close path.
+
+Codex `Stop` is not a session end. The Codex hook install intentionally omits
+`SessionEnd`; `ai-memory finalize-session` finds the latest open Codex session
+for the current workspace/project and posts a synthetic `session-end` event
+through the same server path as real hook clients. Use `--all` only when you
+want to close every matching open Codex session in that scope.
 
 So a typical mixed workflow looks like:
 

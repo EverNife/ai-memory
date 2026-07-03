@@ -14,6 +14,7 @@ use clap::Parser;
 use tracing::info;
 
 mod auth;
+mod auth_bearer;
 mod cli;
 mod commands;
 mod config;
@@ -40,6 +41,7 @@ async fn main() -> Result<()> {
     // the bare path rather than loading the full config.
     let command = match command {
         Command::Hook(args) => return commands::hook::run(data_dir, args).await,
+        Command::HookDrain(_args) => return commands::hook::run_drain(data_dir).await,
         other => other,
     };
 
@@ -71,6 +73,8 @@ async fn main() -> Result<()> {
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),
         // `Hook` is handled in the fast-path above (before config/tracing).
         Command::Hook(args) => commands::hook::run(Some(config.data_dir.clone()), args).await,
+        // `HookDrain` is handled in the fast-path above (before config/tracing).
+        Command::HookDrain(_args) => commands::hook::run_drain(Some(config.data_dir.clone())).await,
         Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
         Command::Commit(args) => commands::commit::run(&config, args).await,
         Command::Checkpoints(args) => commands::checkpoints::run(&config, args).await,
@@ -81,12 +85,14 @@ async fn main() -> Result<()> {
         Command::Curator(args) => commands::curator::run(&config, args).await,
         Command::AutoImproveReport(args) => commands::auto_improve_report::run(&config, args).await,
         Command::AutoImprove(args) => commands::auto_improve::run(&config, args).await,
+        Command::FinalizeSession(args) => commands::finalize_session::run(&config, args).await,
         Command::PendingWrites(args) => commands::pending_writes::run(&config, args).await,
         Command::Embed(args) => commands::embed::run(&config, args).await,
         Command::GenerateAuthToken(args) => commands::generate_auth_token::run(&config, args),
         Command::SetupAgent(args) => commands::setup_agent::run(&config, args),
         Command::Bootstrap(args) => commands::bootstrap::run(&config, args).await,
         Command::InstallInstructions(args) => commands::install_instructions::run(&config, args),
+        Command::InstallSkills(args) => commands::install_skills::run(&config, args),
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,

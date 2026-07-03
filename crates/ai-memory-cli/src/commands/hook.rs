@@ -3,10 +3,11 @@
 //! Reads the event payload from stdin. Instead of POSTing synchronously on the
 //! agent's hot path (which would block every tool call on the network and drop
 //! events against a slow/remote server), the event is **spooled** locally — an
-//! instant write — and the spool is drained to the server at session
-//! boundaries (a cleanup pass on `session-start`, the main flush on
-//! `session-end`). The one synchronous request is the `session-start` handoff
-//! GET, whose result is injected back into the agent as context.
+//! instant write. `session-start` performs a short, lock-aware synchronous
+//! cleanup pass before fetching handoff context. `session-end` returns quickly:
+//! after enqueue it spawns a detached `hook-drain` process, whose stdout/stderr
+//! are redirected away from the agent, and that process drains under an
+//! exclusive spool lock with a longer bounded budget.
 //!
 //! See `docs/windows.md#native-hook-command-claude-code-on-windows`.
 
@@ -20,6 +21,7 @@ use ai_memory_llm::OidcToken;
 use crate::cli::HookArgs;
 
 use super::hook_capture::{build_client, extract_cwd, get_handoff, marker_query_suffix};
+use super::hook_drain_process;
 use super::hook_spool;
 use super::path_util::strip_windows_verbatim_prefix;
 
@@ -31,13 +33,13 @@ use super::path_util::strip_windows_verbatim_prefix;
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_START_BUDGET: Duration = Duration::from_secs(3);
-const DEFAULT_END_BUDGET: Duration = Duration::from_secs(10);
+const DEFAULT_BACKGROUND_DRAIN_BUDGET: Duration = Duration::from_secs(5 * 60);
 const MAX_OVERRIDE_MINUTES: u64 = 60;
 
 const DRAIN_TIMEOUT_ENV: &str = "AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES";
 const HANDOFF_TIMEOUT_ENV: &str = "AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MINUTES";
 const START_BUDGET_ENV: &str = "AI_MEMORY_HOOK_START_BUDGET_MINUTES";
-const END_BUDGET_ENV: &str = "AI_MEMORY_HOOK_END_BUDGET_MINUTES";
+const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES";
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
@@ -62,10 +64,10 @@ fn handoff_timeout() -> Duration {
 fn start_drain_budget() -> Duration {
     start_drain_budget_from(env_lookup)
 }
-/// Total budget for the `session-end` flush (the main delivery point; a session
-/// boundary tolerates more). Env: `AI_MEMORY_HOOK_END_BUDGET_MINUTES`.
-fn end_drain_budget() -> Duration {
-    end_drain_budget_from(env_lookup)
+/// Total budget for detached background drains. Env:
+/// `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES`.
+fn background_drain_budget() -> Duration {
+    background_drain_budget_from(env_lookup)
 }
 
 fn drain_event_timeout_from(lookup: impl FnMut(&str) -> Option<String>) -> Duration {
@@ -80,8 +82,12 @@ fn start_drain_budget_from(lookup: impl FnMut(&str) -> Option<String>) -> Durati
     env_minutes(START_BUDGET_ENV, DEFAULT_START_BUDGET, lookup)
 }
 
-fn end_drain_budget_from(lookup: impl FnMut(&str) -> Option<String>) -> Duration {
-    env_minutes(END_BUDGET_ENV, DEFAULT_END_BUDGET, lookup)
+fn background_drain_budget_from(lookup: impl FnMut(&str) -> Option<String>) -> Duration {
+    env_minutes(
+        BACKGROUND_DRAIN_BUDGET_ENV,
+        DEFAULT_BACKGROUND_DRAIN_BUDGET,
+        lookup,
+    )
 }
 
 /// Backlog size at which `post-tool-use` triggers a mid-session catch-up drain.
@@ -99,10 +105,45 @@ fn incremental_drain_threshold_from(mut lookup: impl FnMut(&str) -> Option<Strin
 
 /// Whether to run a mid-session catch-up drain for this event: only
 /// `post-tool-use` (the highest-frequency event) and only once the spool backlog
-/// has crossed `threshold`. Boundaries (`session-start`/`session-end`) remain
-/// the main flush, so a light session never drains mid-session.
+/// has crossed `threshold`. Boundaries run their own cleanup/background drains,
+/// so a light session never drains mid-session.
 fn should_incremental_drain(event: &str, spool_len: usize, threshold: usize) -> bool {
     event == "post-tool-use" && spool_len >= threshold
+}
+
+fn spawn_background_drainer(data_dir: &Path) -> std::io::Result<()> {
+    hook_drain_process::spawn(data_dir)
+}
+
+fn should_spawn_background_drainer(event: &str) -> bool {
+    matches!(event, "session-end" | "stop" | "pre-compact")
+}
+
+fn after_background_drain_event_enqueue(
+    data_dir: &Path,
+    spawn: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    spawn(data_dir)
+}
+
+/// Hidden drain-only fast path. Reads no stdin and writes no stdout.
+pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let dd = resolve_data_dir(data_dir.as_deref());
+    let spool = hook_spool::spool_dir(&dd);
+    match hook_spool::drain_until_quiescent(
+        &spool,
+        &dd,
+        background_drain_budget(),
+        drain_event_timeout(),
+        hook_spool::DrainLockWait::Bounded(Duration::from_secs(30)),
+    )
+    .await
+    {
+        Ok(hook_spool::LockedDrainResult::Drained(_))
+        | Ok(hook_spool::LockedDrainResult::LockBusy) => {}
+        Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
+    }
+    Ok(())
 }
 
 fn env_lookup(name: &str) -> Option<String> {
@@ -139,6 +180,28 @@ fn parse_minutes(raw: Option<String>, default: Duration) -> Duration {
 pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()> {
     let mut payload = String::new();
     std::io::stdin().read_to_string(&mut payload).ok();
+    let mut stdout = std::io::stdout();
+    run_with_payload(
+        data_dir,
+        args,
+        payload,
+        &mut stdout,
+        spawn_background_drainer,
+    )
+    .await
+}
+
+async fn run_with_payload<W, S>(
+    data_dir: Option<PathBuf>,
+    args: HookArgs,
+    payload: String,
+    stdout: &mut W,
+    spawn_background_drainer: S,
+) -> anyhow::Result<()>
+where
+    W: std::io::Write,
+    S: FnOnce(&Path) -> std::io::Result<()>,
+{
     let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
     let qs = extract_cwd(&json)
@@ -180,11 +243,12 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
         hook_spool::spool_len(&spool),
         incremental_drain_threshold(),
     ) {
-        let _ = hook_spool::drain(
+        let _ = hook_spool::drain_exclusive(
             &spool,
             &dd,
             INCREMENTAL_DRAIN_BUDGET,
             INCREMENTAL_DRAIN_BUDGET,
+            hook_spool::DrainLockWait::NoWait,
         )
         .await;
     }
@@ -192,7 +256,13 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     // session-start: drain any backlog (e.g. from a previous session that ended
     // abruptly), then fetch + inject the pending handoff for the resuming agent.
     if args.event == "session-start" {
-        let _ = hook_spool::drain(&spool, &dd, start_drain_budget(), drain_event_timeout()).await;
+        let _ = hook_spool::drain_exclusive_within_budget(
+            &spool,
+            &dd,
+            start_drain_budget(),
+            drain_event_timeout(),
+        )
+        .await;
         // Only fetch the handoff for agents that inject the session-start
         // hook's stdout as context. Grok ignores it, so fetching here would
         // consume the handoff server-side (the GET is destructive) and then
@@ -211,19 +281,25 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
                         "additionalContext": handoff,
                     }
                 });
-                println!("{envelope}");
+                writeln!(stdout, "{envelope}")?;
                 return Ok(());
             }
         }
     }
 
-    // session-end: the main delivery point — flush the session's spooled
-    // observations (oldest-first) so the server has them before it consolidates.
-    if args.event == "session-end" {
-        let _ = hook_spool::drain(&spool, &dd, end_drain_budget(), drain_event_timeout()).await;
+    // Boundary drain trigger: enqueue first, then ask a detached native drainer
+    // to flush the shared spool. `session-end` remains the primary close path,
+    // but `stop` and `pre-compact` also trigger the helper so delivery does not
+    // rely on the single hook most likely to be cancelled during agent shutdown.
+    if should_spawn_background_drainer(&args.event)
+        && let Err(err) = after_background_drain_event_enqueue(&dd, spawn_background_drainer)
+    {
+        eprintln!(
+            "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
+        );
     }
 
-    println!("{{}}");
+    writeln!(stdout, "{{}}")?;
     Ok(())
 }
 
@@ -280,6 +356,18 @@ mod tests {
         assert!(!should_incremental_drain("session-start", 999, 32));
         assert!(!should_incremental_drain("session-end", 999, 32));
         assert!(!should_incremental_drain("stop", 999, 32));
+    }
+
+    #[test]
+    fn boundary_events_trigger_background_drainer() {
+        assert!(should_spawn_background_drainer("session-end"));
+        assert!(should_spawn_background_drainer("stop"));
+        assert!(should_spawn_background_drainer("pre-compact"));
+
+        assert!(!should_spawn_background_drainer("session-start"));
+        assert!(!should_spawn_background_drainer("post-tool-use"));
+        assert!(!should_spawn_background_drainer("pre-tool-use"));
+        assert!(!should_spawn_background_drainer("user-prompt"));
     }
 
     #[test]
@@ -343,6 +431,152 @@ mod tests {
     }
 
     #[test]
+    fn background_drain_budget_defaults_and_clamps() {
+        assert_eq!(
+            background_drain_budget_from(|_| None),
+            DEFAULT_BACKGROUND_DRAIN_BUDGET
+        );
+        assert_eq!(
+            background_drain_budget_from(|_| Some("1".into())),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            background_drain_budget_from(|_| Some("999".into())),
+            Duration::from_secs(60 * 60)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_run_enqueues_outputs_empty_json_and_spawns_after_enqueue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let called = std::cell::Cell::new(0);
+        let mut stdout = Vec::new();
+        let args = HookArgs {
+            event: "session-end".into(),
+            agent: "claude-code".into(),
+            server_url: "http://127.0.0.1:1".into(),
+            auth_token: None,
+            project_strategy: None,
+        };
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
+            &mut stdout,
+            |path| {
+                assert_eq!(path, data_dir.as_path());
+                assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
+                called.set(called.get() + 1);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert_eq!(called.get(), 1);
+        assert_eq!(
+            hook_spool::spool_len(&spool),
+            1,
+            "session-end must not drain inline"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_and_pre_compact_spawn_background_drainer_after_enqueue() {
+        for event in ["stop", "pre-compact"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_path_buf();
+            let spool = hook_spool::spool_dir(&data_dir);
+            let called = std::cell::Cell::new(0);
+            let mut stdout = Vec::new();
+            let args = HookArgs {
+                event: event.into(),
+                agent: "claude-code".into(),
+                server_url: "http://127.0.0.1:1".into(),
+                auth_token: None,
+                project_strategy: None,
+            };
+
+            run_with_payload(
+                Some(data_dir.clone()),
+                args,
+                r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
+                &mut stdout,
+                |path| {
+                    assert_eq!(path, data_dir.as_path());
+                    assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
+                    called.set(called.get() + 1);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(stdout, b"{}\n", "{event} should keep hook stdout clean");
+            assert_eq!(called.get(), 1, "{event} should start background drain");
+            assert_eq!(
+                hook_spool::spool_len(&spool),
+                1,
+                "{event} must not drain inline"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_end_run_spawn_failure_keeps_event_queued_and_stdout_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let mut stdout = Vec::new();
+        let args = HookArgs {
+            event: "session-end".into(),
+            agent: "claude-code".into(),
+            server_url: "http://127.0.0.1:1".into(),
+            auth_token: None,
+            project_strategy: None,
+        };
+
+        run_with_payload(Some(data_dir), args, "{}".into(), &mut stdout, |_path| {
+            Err(std::io::Error::other("spawn failed"))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert_eq!(hook_spool::spool_len(&spool), 1);
+    }
+
+    #[test]
+    fn session_end_spawn_failure_is_returned_for_warning_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = after_background_drain_event_enqueue(tmp.path(), |_path| {
+            Err(std::io::Error::other("spawn failed"))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn background_drain_event_policy_spawns_without_inline_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let called = std::cell::Cell::new(false);
+
+        after_background_drain_event_enqueue(tmp.path(), |path| {
+            assert_eq!(path, tmp.path());
+            called.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(called.get());
+    }
+
+    #[test]
     fn timing_accessors_read_the_expected_env_vars() {
         fn one_minute_for(expected_name: &'static str) -> impl FnMut(&str) -> Option<String> {
             move |actual_name| {
@@ -364,7 +598,7 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(
-            end_drain_budget_from(one_minute_for(END_BUDGET_ENV)),
+            background_drain_budget_from(one_minute_for(BACKGROUND_DRAIN_BUDGET_ENV)),
             Duration::from_secs(60)
         );
     }

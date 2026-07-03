@@ -67,9 +67,12 @@ pub enum Command {
     /// from stdin), avoiding a shell spawn. Used by the WindowsNative
     /// hook config; mirrors hooks/<agent>/<event>.sh.
     Hook(HookArgs),
+    /// Hidden hook spool drainer used by native session-end hooks.
+    #[command(hide = true, name = "hook-drain")]
+    HookDrain(HookDrainArgs),
     /// Print MCP server registration snippets for any supported client
     /// (Claude Code, Codex, OpenCode, Cursor, Claude Desktop, Gemini
-    /// CLI, OpenClaw, pi). See docs/mcp-install.md for the full guide.
+    /// CLI, OpenClaw, OMP, Pi). See docs/mcp-install.md for the full guide.
     InstallMcp(InstallMcpArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
@@ -89,6 +92,8 @@ pub enum Command {
     AutoImproveReport(AutoImproveReportArgs),
     /// Run auto-improvement for one completed session.
     AutoImprove(AutoImproveArgs),
+    /// Manually finalize the latest open Codex session for this project.
+    FinalizeSession(FinalizeSessionArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
     PendingWrites(PendingWritesArgs),
     /// Compute + store embeddings for every latest page (M9).
@@ -106,12 +111,14 @@ pub enum Command {
     /// project that's been around for a while. Requires
     /// AI_MEMORY_LLM_PROVIDER configured on the server.
     Bootstrap(BootstrapArgs),
-    /// Install the ai-memory usage snippet into the project's
-    /// CLAUDE.md / AGENTS.md (or any markdown file you specify).
+    /// Install the ai-memory usage snippet and managed Agent Skills into the
+    /// project (or any markdown file / skill root you specify).
     /// Idempotent — bracketed by `<!-- ai-memory:start -->` /
     /// `<!-- ai-memory:end -->` markers so re-running replaces the
     /// block in place without duplicating.
     InstallInstructions(InstallInstructionsArgs),
+    /// Install core-managed ai-memory Agent Skills into agent skill directories.
+    InstallSkills(InstallSkillsArgs),
     /// Retro-fit existing sessions + observations to per-cwd projects
     /// based on the cwd captured at session-start. Pages are marked
     /// `is_latest=false` (they were a multi-project mash-up) so the
@@ -133,8 +140,8 @@ pub enum Command {
     /// copy+purge (only durable pages migrate, source purged). Either way the
     /// operation is irreversible — requires `--confirm`.
     MoveProject(MoveProjectArgs),
-    /// Remove ai-memory's wiring (hooks, MCP, instructions) from all
-    /// detected agents. Dry-run unless `--apply`.
+    /// Remove ai-memory's wiring (hooks, MCP, instructions, and default-root
+    /// managed skills) from all detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
     /// Manage optional upstream LLM provider authentication.
     Auth(AuthArgs),
@@ -309,12 +316,13 @@ pub struct AuthLogoutArgs {
 #[derive(Debug, Args)]
 pub struct AuthStatusArgs {}
 
-/// Which concern `uninstall` should touch. Omitted = all three.
+/// Which concern `uninstall` should touch. Omitted = all four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum UninstallOnly {
     Hooks,
     Mcp,
     Instructions,
+    Skills,
 }
 
 /// Arguments for `uninstall`.
@@ -329,7 +337,7 @@ pub struct UninstallArgs {
     /// meaningful with `--apply`.
     #[arg(long)]
     pub purge_data: bool,
-    /// Limit to one concern. Omitted = hooks + mcp + instructions.
+    /// Limit to one concern. Omitted = hooks + mcp + instructions + skills.
     #[arg(long, value_enum)]
     pub only: Option<UninstallOnly>,
     /// Optional MCP server entry-name filter. Uninstall never matches by name
@@ -432,13 +440,73 @@ pub struct InstallInstructionsArgs {
     /// to override the auto-detection.
     #[arg(long)]
     pub target: Option<PathBuf>,
-    /// Print the snippet to stdout instead of mutating the file.
+    /// Print the snippet to stdout instead of mutating files.
     /// The default IS mutation here (the print form is also
     /// available without this command — copy the block from the
     /// README). Pass `--print` to preview what would land in
-    /// the file.
+    /// the file. This does not print skill payloads; use
+    /// `install-skills --print` to preview managed Agent Skills.
     #[arg(long)]
     pub print: bool,
+    /// Skip installing/updating the managed ai-memory Agent Skills.
+    #[arg(long)]
+    pub no_skills: bool,
+    /// Scope for managed ai-memory skill installation.
+    #[arg(long = "skills-scope", value_enum)]
+    pub skills_scope: Option<InstallSkillsScope>,
+    /// Agent skill directory family for managed ai-memory skill installation.
+    #[arg(long = "skills-agent", value_enum)]
+    pub skills_agent: Option<InstallSkillsAgent>,
+    /// Override the managed skill root directory.
+    #[arg(long = "skills-target-dir")]
+    pub skills_target_dir: Option<PathBuf>,
+    /// Overwrite same-named unmanaged skills while installing from `install-instructions`.
+    #[arg(long = "skills-force")]
+    pub skills_force: bool,
+}
+
+/// Skill install scope for `install-skills`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallSkillsScope {
+    /// Install into this project's agent skill directories.
+    Project,
+    /// Install into the user's global agent skill directories.
+    Global,
+}
+
+/// Agent skill directory family for `install-skills`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallSkillsAgent {
+    /// Claude Code's `.claude/skills` directory.
+    ClaudeCode,
+    /// Cross-agent `.agents/skills` directory.
+    Agents,
+    /// Install into both Claude Code and `.agents` skill directories.
+    Both,
+}
+
+/// Arguments for `install-skills`.
+#[derive(Debug, Args)]
+pub struct InstallSkillsArgs {
+    /// Install project-local skills or global user skills.
+    #[arg(long, value_enum, default_value_t = InstallSkillsScope::Project)]
+    pub scope: InstallSkillsScope,
+    /// Which agent skill directory family to install into.
+    #[arg(long, value_enum, default_value_t = InstallSkillsAgent::ClaudeCode)]
+    pub agent: InstallSkillsAgent,
+    /// Override the skill root directory. When set, `--scope` and
+    /// `--agent` are ignored and the managed skill directories are
+    /// written below this root.
+    #[arg(long)]
+    pub target_dir: Option<PathBuf>,
+    /// Print target paths and SKILL.md contents without writing files.
+    #[arg(long)]
+    pub print: bool,
+    /// Overwrite same-named existing skills that do not contain the
+    /// ai-memory managed marker. Without this flag, unmanaged skills
+    /// are preserved and the command exits with an actionable error.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `bootstrap`.
@@ -728,10 +796,13 @@ pub enum AgentChoice {
     /// them straight to `--agent`, which used to fail on this one.
     #[value(alias = "opencode")]
     OpenCode,
-    /// Oh My Pi (`omp`) / Pi coding agent fork — TypeScript extension
+    /// Real Pi coding agent. Recognized separately from OMP, but hook
+    /// install intentionally fails closed until the Pi bridge lands.
+    Pi,
+    /// Oh My Pi (`omp`) — TypeScript extension
     /// under `~/.omp/agent/extensions/`. `--apply` writes the extension
     /// file directly; restart `omp` for it to load.
-    #[value(alias = "pi", alias = "oh-my-pi")]
+    #[value(alias = "oh-my-pi")]
     Omp,
     /// OpenClaw personal AI gateway — native plugin package with
     /// session/tool/compaction hooks.
@@ -747,6 +818,63 @@ pub enum AgentChoice {
     /// capture works but handoff injection does not — recover the prior
     /// session's handoff via the MCP `memory_handoff_accept` tool.
     Grok,
+}
+
+impl AgentChoice {
+    /// The core [`AgentKind`] this CLI choice selects — the single mapping
+    /// point between the clap surface and the domain enum. Wire strings,
+    /// hook-bundle directory names, and session attribution all derive from
+    /// the returned kind's `as_str()`; adding an agent means extending this
+    /// match once instead of hunting per-command copies.
+    #[must_use]
+    pub const fn kind(self) -> ai_memory_core::AgentKind {
+        use ai_memory_core::AgentKind;
+        match self {
+            Self::ClaudeCode => AgentKind::ClaudeCode,
+            Self::Codex => AgentKind::Codex,
+            Self::Cursor => AgentKind::Cursor,
+            Self::GeminiCli => AgentKind::GeminiCli,
+            Self::OpenCode => AgentKind::OpenCode,
+            Self::Pi => AgentKind::Pi,
+            Self::Omp => AgentKind::Omp,
+            Self::Openclaw => AgentKind::OpenClaw,
+            Self::AntigravityCli => AgentKind::AntigravityCli,
+            Self::Grok => AgentKind::Grok,
+        }
+    }
+
+    /// `hooks/<subdir>` bundle name for agents that install script hooks.
+    /// `None` for agents wired through a generated integration (plugin /
+    /// extension) instead of a script directory. The subdir equals the
+    /// kind's wire string for every script agent.
+    #[must_use]
+    pub const fn script_hook_subdir(self) -> Option<&'static str> {
+        match self {
+            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw => None,
+            _ => Some(self.kind().as_str()),
+        }
+    }
+}
+
+/// Arguments for `finalize-session`.
+#[derive(Debug, Args)]
+pub struct FinalizeSessionArgs {
+    /// Agent kind to finalize. Defaults to Codex because Codex has no reliable
+    /// true SessionEnd hook.
+    #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
+    pub agent: AgentChoice,
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the current project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Finalize every matching open session instead of just the latest one.
+    #[arg(long)]
+    pub all: bool,
+    /// Emit a JSON summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// MCP client to render configuration for. Includes both the
@@ -774,9 +902,11 @@ pub enum McpClient {
     GeminiCli,
     /// OpenClaw personal AI gateway — `~/.openclaw/config.json`.
     Openclaw,
-    /// Oh My Pi (`omp`) / Pi-compatible coding agent — `~/.omp/agent/mcp.json`.
-    #[value(alias = "omp", alias = "oh-my-pi")]
+    /// Real Pi coding agent. Pi core has no native MCP config yet.
     Pi,
+    /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
+    #[value(alias = "oh-my-pi")]
+    Omp,
     /// Google Antigravity CLI (`agy`) — `~/.gemini/antigravity-cli/mcp_config.json`.
     #[value(alias = "antigravity", alias = "agy")]
     AntigravityCli,
@@ -1085,6 +1215,10 @@ pub struct HookArgs {
     pub project_strategy: Option<ProjectStrategyArg>,
 }
 
+/// Arguments for hidden `hook-drain`.
+#[derive(Debug, Args)]
+pub struct HookDrainArgs {}
+
 /// Arguments for `install-hooks`.
 #[derive(Debug, Args)]
 pub struct InstallHooksArgs {
@@ -1299,8 +1433,8 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn pi_mcp_client_aliases_parse_to_same_variant() {
-        for alias in ["pi", "omp", "oh-my-pi"] {
+    fn pi_and_omp_mcp_clients_parse_to_distinct_variants() {
+        for (alias, expected_pi) in [("pi", true), ("omp", false), ("oh-my-pi", false)] {
             let cli = Cli::try_parse_from([
                 "ai-memory",
                 "install-mcp",
@@ -1315,8 +1449,9 @@ mod tests {
                 panic!("expected install-mcp command for alias {alias}");
             };
             assert!(
-                matches!(args.client, McpClient::Pi),
-                "alias {alias} must resolve to the Pi/OMP MCP client"
+                matches!(args.client, McpClient::Pi) == expected_pi,
+                "alias {alias} resolved to unexpected MCP client: {:?}",
+                args.client
             );
         }
     }
@@ -1511,8 +1646,8 @@ mod tests {
     }
 
     #[test]
-    fn pi_hook_agent_aliases_parse_to_same_variant() {
-        for alias in ["omp", "pi", "oh-my-pi"] {
+    fn pi_and_omp_hook_agents_parse_to_distinct_variants() {
+        for (alias, expected_pi) in [("pi", true), ("omp", false), ("oh-my-pi", false)] {
             let cli = Cli::try_parse_from([
                 "ai-memory",
                 "install-hooks",
@@ -1527,8 +1662,9 @@ mod tests {
                 panic!("expected install-hooks command for alias {alias}");
             };
             assert!(
-                matches!(args.agent, AgentChoice::Omp),
-                "alias {alias} must resolve to the OMP hook agent"
+                matches!(args.agent, AgentChoice::Pi) == expected_pi,
+                "alias {alias} resolved to unexpected hook agent: {:?}",
+                args.agent
             );
         }
     }

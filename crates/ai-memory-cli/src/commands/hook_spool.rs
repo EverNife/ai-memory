@@ -1,11 +1,13 @@
 //! Local spool for lifecycle-hook events — decouples capture from the network.
 //!
-//! Per-tool-call hooks (`pre-tool-use`, `post-tool-use`, `user-prompt-submit`,
-//! `stop`) append an event here (an instant local write) instead of POSTing
-//! synchronously. The spool is drained to the server at **session boundaries**
-//! (a cleanup pass at `session-start`, the main flush at `session-end`), where a
-//! few seconds of latency is acceptable — unlike the per-tool-call hot path,
-//! which must never block the agent.
+//! Per-tool-call hooks (`pre-tool-use`, `post-tool-use`, `user-prompt-submit`)
+//! append an event here (an instant local write) instead of POSTing
+//! synchronously. The spool is drained to the server at **session boundaries**:
+//! a cleanup pass at `session-start`, detached background flushes at
+//! cancellation-prone boundaries (`stop`, `pre-compact`, `session-end`), and a
+//! small threshold-triggered catch-up on busy `post-tool-use` streams. A few
+//! seconds of latency is acceptable at boundaries, unlike the per-tool-call hot
+//! path, which must never block the agent.
 //!
 //! This makes capture reliable against a remote/slow server (no event is lost:
 //! a file persists until the server answers 2xx) without ever blocking a tool
@@ -18,12 +20,12 @@
 //! `auth.json` at drain time (so a token that expired while the event waited is
 //! renewed rather than rejected).
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ai_memory_llm::{OidcToken, refresh_access_token};
-use secrecy::ExposeSecret as _;
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use super::hook_capture::{BatchOutcome, PostOutcome, build_client, post_batch, post_hook};
@@ -185,6 +187,178 @@ pub struct DrainResult {
     pub dropped: usize,
 }
 
+/// How long to wait for the exclusive drain lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainLockWait {
+    /// Do not wait if another drainer is active.
+    NoWait,
+    /// Poll for the lock until this bounded budget expires.
+    Bounded(Duration),
+}
+
+/// An exclusive hook-spool drain lock. The OS releases it when dropped.
+pub struct DrainLock {
+    _file: File,
+}
+
+/// Windows can report a contended fs2 byte-range lock as this native OS code
+/// instead of mapping it to `WouldBlock`.
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+fn is_drain_lock_busy_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+        return true;
+    }
+
+    false
+}
+
+/// Outcome for lock-aware drain wrappers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LockedDrainResult {
+    /// The lock was acquired and a drain ran.
+    Drained(DrainResult),
+    /// Another process is draining; this is expected and not an error.
+    LockBusy,
+}
+
+/// Try to acquire the single-flight drain lock.
+pub fn acquire_drain_lock(spool: &Path, wait: DrainLockWait) -> std::io::Result<Option<DrainLock>> {
+    std::fs::create_dir_all(spool)?;
+    let path = spool.join(".drain.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(Some(DrainLock { _file: file })),
+            Err(err) if is_drain_lock_busy_error(&err) => match wait {
+                DrainLockWait::NoWait => return Ok(None),
+                DrainLockWait::Bounded(limit) if started.elapsed() >= limit => return Ok(None),
+                DrainLockWait::Bounded(limit) => {
+                    let sleep =
+                        Duration::from_millis(25).min(limit.saturating_sub(started.elapsed()));
+                    if sleep.is_zero() {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(sleep);
+                }
+            },
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Run one exclusive drain pass if the single-flight lock is available.
+pub async fn drain_exclusive(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+) -> Option<DrainResult> {
+    match drain_exclusive_result(spool, data_dir, total_budget, per_event_timeout, wait).await {
+        Ok(LockedDrainResult::Drained(result)) => Some(result),
+        Ok(LockedDrainResult::LockBusy) | Err(_) => None,
+    }
+}
+
+/// Run one exclusive drain pass, distinguishing lock contention from lock IO errors.
+pub async fn drain_exclusive_result(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+) -> std::io::Result<LockedDrainResult> {
+    let Some(_lock) = acquire_drain_lock(spool, wait)? else {
+        return Ok(LockedDrainResult::LockBusy);
+    };
+    Ok(LockedDrainResult::Drained(
+        drain(spool, data_dir, total_budget, per_event_timeout).await,
+    ))
+}
+
+/// Run one exclusive drain pass while treating lock wait + drain as one budget.
+pub async fn drain_exclusive_within_budget(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+) -> std::io::Result<LockedDrainResult> {
+    let started = Instant::now();
+    let Some(_lock) = acquire_drain_lock(spool, DrainLockWait::Bounded(total_budget))? else {
+        return Ok(LockedDrainResult::LockBusy);
+    };
+    let Some(remaining_budget) = total_budget.checked_sub(started.elapsed()) else {
+        return Ok(LockedDrainResult::Drained(DrainResult {
+            remaining: spool_len(spool),
+            ..DrainResult::default()
+        }));
+    };
+    if remaining_budget.is_zero() {
+        return Ok(LockedDrainResult::Drained(DrainResult {
+            remaining: spool_len(spool),
+            ..DrainResult::default()
+        }));
+    }
+    Ok(LockedDrainResult::Drained(
+        drain(spool, data_dir, remaining_budget, per_event_timeout).await,
+    ))
+}
+
+/// Hold the drain lock and keep draining until the spool is quiescent or budget expires.
+pub async fn drain_until_quiescent(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+) -> std::io::Result<LockedDrainResult> {
+    let Some(_lock) = acquire_drain_lock(spool, wait)? else {
+        return Ok(LockedDrainResult::LockBusy);
+    };
+    let started = Instant::now();
+    let mut combined = DrainResult::default();
+
+    loop {
+        let Some(remaining_budget) = total_budget.checked_sub(started.elapsed()) else {
+            combined.remaining = spool_len(spool);
+            return Ok(LockedDrainResult::Drained(combined));
+        };
+        if remaining_budget.is_zero() {
+            combined.remaining = spool_len(spool);
+            return Ok(LockedDrainResult::Drained(combined));
+        }
+
+        let result = drain(spool, data_dir, remaining_budget, per_event_timeout).await;
+        combined.sent += result.sent;
+        combined.dropped += result.dropped;
+        combined.remaining = result.remaining;
+
+        if result.remaining > 0 {
+            return Ok(LockedDrainResult::Drained(combined));
+        }
+
+        let queued = spool_len(spool);
+        if queued == 0 {
+            combined.remaining = 0;
+            return Ok(LockedDrainResult::Drained(combined));
+        }
+        combined.remaining = queued;
+    }
+}
+
 /// Drain the spool to the server, oldest-first, within `total_budget`.
 ///
 /// Events are delivered in **batches** via `POST /hook/batch`: one request
@@ -197,9 +371,10 @@ pub struct DrainResult {
 /// drain transparently falls back to per-event `POST /hook`.
 ///
 /// A delivered event is deleted; a failed one is charged a retry attempt
-/// (dropped at `MAX_ATTEMPTS`); a `429` (saturation) is retried untouched so it
-/// never burns the retry budget. OIDC bearer is resolved + refreshed at most
-/// once per drain and cached.
+/// (dropped at `MAX_ATTEMPTS`); a `429` (saturation) deletes any accepted prefix
+/// the server reports, then retries the rest untouched so it never burns the
+/// retry budget. OIDC bearer is resolved + refreshed at most once per drain and
+/// cached.
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
@@ -309,10 +484,18 @@ pub async fn drain(
                         break;
                     }
                 }
-                BatchOutcome::Saturated => {
-                    // Server ingest is full; further batches would 429 too. Leave
-                    // everything queued, no attempt bump (parity with per-event).
-                    result.remaining += chunk.len() + files.len().saturating_sub(idx);
+                BatchOutcome::Saturated(k) => {
+                    // Server ingest filled after committing a leading prefix.
+                    // Delete only that prefix; leave the saturated item and all
+                    // later entries queued without bumping attempts (parity with
+                    // per-event 429 handling).
+                    let k = k.min(chunk.len());
+                    for (path, _) in &chunk[..k] {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    result.sent += k;
+                    result.remaining +=
+                        chunk.len().saturating_sub(k) + files.len().saturating_sub(idx);
                     break;
                 }
                 BatchOutcome::Unsupported => {
@@ -441,7 +624,9 @@ async fn entry_bearer(
         AuthMode::Anonymous => None,
         AuthMode::Oidc => {
             if oidc_cache.is_none() {
-                *oidc_cache = Some(resolve_oidc(client, data_dir).await);
+                *oidc_cache = Some(
+                    crate::auth_bearer::resolve_oidc(client, &data_dir.join("auth.json")).await,
+                );
             }
             oidc_cache.clone().flatten()
         }
@@ -526,25 +711,7 @@ pub async fn resolve_bearer(
     data_dir: &Path,
     auth_token: Option<&str>,
 ) -> Option<String> {
-    match auth_token {
-        Some(t) => Some(t.to_string()),
-        None => resolve_oidc(client, data_dir).await,
-    }
-}
-
-/// Load the stored OIDC token, refreshing (and persisting) it when stale.
-/// Returns the access token, or None when there's no token / refresh failed.
-async fn resolve_oidc(client: &reqwest::Client, data_dir: &Path) -> Option<String> {
-    let auth_path = data_dir.join("auth.json");
-    let mut token = OidcToken::load(&auth_path).ok().flatten()?;
-    if token.needs_refresh() {
-        let Ok(refreshed) = refresh_access_token(client, &token).await else {
-            return None;
-        };
-        let _ = refreshed.save(&auth_path);
-        token = refreshed;
-    }
-    Some(token.access.expose_secret().to_string())
+    crate::auth_bearer::resolve_bearer(client, &data_dir.join("auth.json"), auth_token).await
 }
 
 fn prune_spool_file_count(spool: &Path) {
@@ -599,6 +766,18 @@ mod tests {
 
         let a = entry_for("u".into(), "{}".into(), None, false);
         assert_eq!(a.auth_mode, AuthMode::Anonymous);
+    }
+
+    #[tokio::test]
+    async fn resolve_bearer_delegates_static_and_absent_oidc_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+
+        let static_bearer = resolve_bearer(&client, tmp.path(), Some("static-token")).await;
+        let absent_bearer = resolve_bearer(&client, tmp.path(), None).await;
+
+        assert_eq!(static_bearer.as_deref(), Some("static-token"));
+        assert!(absent_bearer.is_none());
     }
 
     #[test]
@@ -703,6 +882,150 @@ mod tests {
         )
         .await;
         assert_eq!(r, DrainResult::default());
+    }
+
+    #[test]
+    fn drain_lock_is_exclusive_and_released_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+
+        let first = acquire_drain_lock(&spool, DrainLockWait::NoWait)
+            .unwrap()
+            .expect("first lock acquired");
+        assert!(
+            acquire_drain_lock(&spool, DrainLockWait::NoWait)
+                .unwrap()
+                .is_none(),
+            "overlapping lock should not acquire"
+        );
+
+        drop(first);
+        assert!(
+            acquire_drain_lock(&spool, DrainLockWait::NoWait)
+                .unwrap()
+                .is_some(),
+            "lock should release on drop"
+        );
+    }
+
+    #[test]
+    fn would_block_lock_error_is_lock_busy() {
+        let err = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert!(is_drain_lock_busy_error(&err));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_violation_error_is_lock_busy() {
+        let err = std::io::Error::from_raw_os_error(ERROR_LOCK_VIOLATION);
+        assert!(is_drain_lock_busy_error(&err));
+    }
+
+    #[test]
+    fn unrelated_lock_error_is_not_lock_busy() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_drain_lock_busy_error(&err));
+    }
+
+    #[tokio::test]
+    async fn drain_exclusive_skips_when_lock_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let _held = acquire_drain_lock(&spool, DrainLockWait::NoWait)
+            .unwrap()
+            .expect("held lock");
+
+        let result = drain_exclusive(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DrainLockWait::NoWait,
+        )
+        .await;
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_exclusive_within_budget_zero_budget_leaves_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            "http://127.0.0.1:1/hook?event=e0".into(),
+        );
+
+        let result = drain_exclusive_within_budget(
+            &spool,
+            tmp.path(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let LockedDrainResult::Drained(result) = result else {
+            panic!("lock should not be busy")
+        };
+
+        assert_eq!(result.sent, 0);
+        assert_eq!(result.remaining, 1);
+        assert_eq!(spool_len(&spool), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_until_quiescent_catches_new_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook_and_enqueue_on_first(req_count.clone(), spool.clone()).await;
+
+        write_spool_entry(
+            &spool,
+            "first.json",
+            format!("http://{addr}/hook?event=first"),
+        );
+
+        let result = drain_until_quiescent(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            DrainLockWait::NoWait,
+        )
+        .await
+        .expect("lock acquired");
+        let LockedDrainResult::Drained(result) = result else {
+            panic!("lock should not be busy")
+        };
+
+        assert_eq!(result.sent, 2);
+        assert_eq!(result.remaining, 0);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(list_entries(&spool).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_until_quiescent_reports_lock_io_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, b"file").unwrap();
+
+        let err = drain_until_quiescent(
+            &not_a_dir,
+            tmp.path(),
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            DrainLockWait::NoWait,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+        ));
     }
 
     #[tokio::test]
@@ -814,6 +1137,46 @@ mod tests {
         assert_eq!(loaded.attempts, 0, "429 must not consume the retry budget");
     }
 
+    #[tokio::test]
+    async fn partial_429_deletes_prefix_without_bumping_saturated_item() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr =
+            serve_counting_hook_with_accept(req_count.clone(), "429 Too Many Requests", Some(1))
+                .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{addr}/hook?event=e{i}"),
+            );
+        }
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1);
+        assert_eq!(r.dropped, 0);
+        assert_eq!(r.remaining, 2);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut files = list_entries(&spool).unwrap();
+        files.sort();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].ends_with("evt-1.json"));
+        assert!(files[1].ends_with("evt-2.json"));
+        assert_eq!(
+            sorted_attempts(&spool),
+            vec![0, 0],
+            "saturation must not bump retry attempts for the first unaccepted item"
+        );
+    }
+
     /// A mock hook server: answers `200 {"accepted":N}` to `POST /hook/batch`
     /// (N = array length in the body) and `202 queued` to a per-event
     /// `POST /hook`. Counts every request so a test can assert batching. Reads
@@ -891,6 +1254,47 @@ mod tests {
                         .and_then(|v| v.as_array().map(Vec::len))
                         .unwrap_or(0);
                     tokio::time::sleep(delay).await;
+                    let body = format!("{{\"accepted\":{accepted}}}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr.to_string()
+    }
+
+    async fn serve_counting_hook_and_enqueue_on_first(
+        req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        spool: PathBuf,
+    ) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let rc = req_count.clone();
+                let spool = spool.clone();
+                let addr = addr.to_string();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let previous = rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if previous == 0 {
+                        write_spool_entry(
+                            &spool,
+                            "second.json",
+                            format!("http://{addr}/hook?event=second"),
+                        );
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let payload = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let accepted = serde_json::from_str::<serde_json::Value>(payload)
+                        .ok()
+                        .and_then(|v| v.as_array().map(Vec::len))
+                        .unwrap_or(0);
                     let body = format!("{{\"accepted\":{accepted}}}");
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

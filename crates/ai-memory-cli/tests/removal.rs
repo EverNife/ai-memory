@@ -1,8 +1,11 @@
-//! End-to-end: install hooks into a temp HOME, then uninstall, and
+//! End-to-end: add hooks into a temp HOME, then remove them, and
 //! assert the file round-trips (our entries gone, third-party intact).
 
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
+
+use ai_memory_core::routing_skills::{MANAGED_MARKER, MANAGED_SKILLS};
 
 static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -12,6 +15,51 @@ fn cli_test_lock() -> MutexGuard<'static, ()> {
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-memory")
+}
+
+fn command_with_home(home: &Path) -> Command {
+    let mut command = Command::new(bin());
+    let config_home = home.join(".config");
+    let data_home = home.join(".local/share");
+    let app_data = home.join("AppData/Roaming");
+    let local_app_data = home.join("AppData/Local");
+    for dir in [&config_home, &data_home, &app_data, &local_app_data] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_DATA_HOME", data_home)
+        .env("APPDATA", app_data)
+        .env("LOCALAPPDATA", local_app_data)
+        .env("AI_MEMORY_HOME", home)
+        .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"));
+    command
+}
+
+fn normalize_path_text(value: impl AsRef<str>) -> String {
+    value.as_ref().replace('\\', "/")
+}
+
+fn run_uninstall(project: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    command_with_home(home)
+        .args(args)
+        .current_dir(project)
+        .output()
+        .unwrap()
+}
+
+fn write_file(path: &Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+fn managed_skill_content() -> String {
+    format!(
+        "---\nname: test\n---\n{}\nmanaged test skill\n",
+        MANAGED_MARKER
+    )
 }
 
 #[test]
@@ -28,21 +76,15 @@ fn install_then_uninstall_round_trip_claude_hooks() {
     .unwrap();
 
     // Install ai-memory hooks for Claude Code.
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["install-hooks", "--agent", "claude-code", "--apply"])
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local/share"))
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "install-hooks failed");
 
     // Uninstall (hooks only) and verify.
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("XDG_DATA_HOME", home.path().join(".local/share"))
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -82,10 +124,8 @@ fn uninstall_apply_is_idempotent() {
     .unwrap();
 
     let run = || {
-        std::process::Command::new(bin())
+        command_with_home(home.path())
             .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-            .env("HOME", home.path())
-            .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
             .status()
             .unwrap()
     };
@@ -121,10 +161,8 @@ fn only_hooks_preserves_mcp_in_same_file() {
     )
     .unwrap();
 
-    let status = std::process::Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success());
@@ -153,10 +191,8 @@ fn uninstall_preserves_user_opencode_plugin_at_ai_memory_path() {
     let original = "// user-owned plugin that happens to use this filename\nexport default {};\n";
     std::fs::write(&plugin, original).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -179,10 +215,8 @@ fn uninstall_deletes_generated_opencode_plugin_only() {
     let sibling = plugins.join("other.ts");
     std::fs::write(&sibling, "keep me\n").unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -201,10 +235,8 @@ fn uninstall_omp_extension_deletes_only_generated_file() {
     let user_content = "// user-owned extension that happens to use this filename\n";
     std::fs::write(&extension, user_content).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -216,14 +248,46 @@ fn uninstall_omp_extension_deletes_only_generated_file() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
     assert!(!extension.exists(), "generated extension should be deleted");
+}
+
+#[test]
+fn uninstall_pi_extension_deletes_only_generated_bridge_file() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let extensions = home.path().join(".pi/agent/extensions");
+    std::fs::create_dir_all(&extensions).unwrap();
+    let extension = extensions.join("ai-memory.ts");
+    let user_content = "// user-owned Pi extension\n";
+    std::fs::write(&extension, user_content).unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+    assert_eq!(std::fs::read_to_string(&extension).unwrap(), user_content);
+
+    std::fs::write(
+        &extension,
+        "// Auto-generated by `ai-memory install-hooks --agent pi --apply`.\nconst AGENT = \"pi\";\npi.registerTool({ name: \"memory_status\" });\n",
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+    assert!(
+        !extension.exists(),
+        "generated Pi extension should be deleted"
+    );
 }
 
 #[test]
@@ -237,11 +301,9 @@ fn uninstall_preserves_user_openclaw_package_at_ai_memory_path() {
     let original = r#"{"name":"@ai-memory/openclaw-plugin","private":true}"#;
     std::fs::write(&package, original).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
         .env("XDG_DATA_HOME", &data)
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -275,10 +337,8 @@ fn uninstall_antigravity_hooks_preserves_user_entries() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -316,7 +376,7 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args([
             "uninstall",
             "--apply",
@@ -326,8 +386,6 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
             "http://lan:49374/mcp",
             "--yes",
         ])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -358,7 +416,7 @@ fn uninstall_mcp_name_narrows_endpoint_match() {
     )
     .unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args([
             "uninstall",
             "--apply",
@@ -368,8 +426,6 @@ fn uninstall_mcp_name_narrows_endpoint_match() {
             "ai-memory",
             "--yes",
         ])
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success(), "uninstall failed");
@@ -389,16 +445,217 @@ fn uninstall_dry_run_changes_nothing() {
     let original = r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=x /a/stop.sh"}]}]}}"#;
     std::fs::write(claude.join("settings.json"), original).unwrap();
 
-    let status = Command::new(bin())
+    let status = command_with_home(home.path())
         .args(["uninstall", "--only", "hooks"]) // no --apply
-        .env("HOME", home.path())
-        .env("AI_MEMORY_DATA_DIR", home.path().join(".ai-memory-data"))
         .status()
         .unwrap();
     assert!(status.success());
 
     let after = std::fs::read_to_string(claude.join("settings.json")).unwrap();
     assert_eq!(after, original, "dry-run must not modify the file");
+}
+
+#[test]
+fn default_uninstall_removes_managed_skills_across_roots_and_preserves_user_content() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let managed_content = managed_skill_content();
+
+    let project_claude = project.path().join(".claude/skills");
+    let project_agents = project.path().join(".agents/skills");
+    let global_claude = home.path().join(".claude/skills");
+    let global_agents = home.path().join(".agents/skills");
+
+    let managed_paths = [
+        project_claude.join(MANAGED_SKILLS[0].relative_path),
+        project_agents.join(MANAGED_SKILLS[2].relative_path),
+        global_claude.join(MANAGED_SKILLS[3].relative_path),
+        global_agents.join(MANAGED_SKILLS[4].relative_path),
+    ];
+    for path in &managed_paths {
+        write_file(path, &managed_content);
+    }
+
+    let unmanaged_same_name = project_claude.join(MANAGED_SKILLS[1].relative_path);
+    let unmanaged_content = "---\nname: ai-memory-handoff\n---\nuser-owned same-name skill\n";
+    write_file(&unmanaged_same_name, unmanaged_content);
+
+    let unrelated_sibling = project_claude.join("user-skill/SKILL.md");
+    write_file(&unrelated_sibling, "---\nname: user-skill\n---\nkeep me\n");
+
+    let extra_file_in_managed_dir = managed_paths[1].parent().unwrap().join("notes.txt");
+    write_file(&extra_file_in_managed_dir, "keep this sibling file\n");
+
+    let output = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--apply", "--yes"],
+    );
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for path in &managed_paths {
+        assert!(
+            !path.exists(),
+            "managed skill file should be removed: {path:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&unmanaged_same_name).unwrap(),
+        unmanaged_content,
+        "unmanaged same-name skill must be preserved"
+    );
+    assert!(
+        unrelated_sibling.exists(),
+        "unrelated sibling skill survives"
+    );
+    assert!(
+        extra_file_in_managed_dir.exists(),
+        "non-empty managed skill directory must not be removed"
+    );
+    assert!(
+        !managed_paths[0].parent().unwrap().exists(),
+        "empty managed skill directory should be removed"
+    );
+    assert!(
+        !global_claude.exists() && !global_agents.exists(),
+        "empty global skill roots should be removed"
+    );
+}
+
+#[test]
+fn install_skills_then_uninstall_only_skills_round_trips() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let install = command_with_home(home.path())
+        .args(["install-skills", "--scope", "project", "--agent", "both"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    for root in [
+        project.path().join(".claude/skills"),
+        project.path().join(".agents/skills"),
+    ] {
+        for skill in MANAGED_SKILLS {
+            assert!(root.join(skill.relative_path).exists());
+        }
+    }
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    assert!(
+        !project.path().join(".claude/skills").exists(),
+        "empty Claude skills root should be removed"
+    );
+    assert!(
+        !project.path().join(".agents/skills").exists(),
+        "empty .agents skills root should be removed"
+    );
+}
+
+#[test]
+fn uninstall_only_skills_leaves_custom_target_dir_for_manual_cleanup() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let custom_root = project.path().join("custom-skills");
+
+    let install = command_with_home(home.path())
+        .args([
+            "install-skills",
+            "--target-dir",
+            custom_root.to_str().unwrap(),
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-skills failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let custom_skill = custom_root.join(MANAGED_SKILLS[0].relative_path);
+    assert!(custom_skill.exists());
+
+    let uninstall = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills", "--apply", "--yes"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    assert!(
+        custom_skill.exists(),
+        "custom --target-dir skill roots are intentionally left for manual cleanup"
+    );
+    assert!(!project.path().join(".claude/skills").exists());
+    assert!(!project.path().join(".agents/skills").exists());
+}
+
+#[test]
+fn uninstall_skills_dry_run_reports_plan_without_mutating() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let skill_path = project
+        .path()
+        .join(".claude/skills")
+        .join(MANAGED_SKILLS[0].relative_path);
+    let original = managed_skill_content();
+    write_file(&skill_path, &original);
+
+    let output = run_uninstall(
+        project.path(),
+        home.path(),
+        &["uninstall", "--only", "skills"],
+    );
+    assert!(
+        output.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("would delete"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("managed Agent Skill"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        normalize_path_text(&stdout)
+            .contains(&normalize_path_text(skill_path.display().to_string())),
+        "stdout was: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&skill_path).unwrap(),
+        original,
+        "dry-run must not remove or rewrite managed skill"
+    );
 }
 
 #[test]
@@ -413,9 +670,8 @@ fn uninstall_purge_data_apply_wipes() {
     std::fs::create_dir_all(data.path().join("logs")).unwrap();
     std::fs::write(data.path().join("logs/app.log"), b"l").unwrap();
 
-    let out = Command::new(bin())
+    let out = command_with_home(home.path())
         .args(["uninstall", "--apply", "--yes", "--purge-data"])
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         // Exercises the WIPE, not the live-process guard; opt out so an
         // unrelated `ai-memory` on the machine can't make it flake. The
@@ -451,9 +707,8 @@ fn uninstall_dry_run_previews_purge() {
         std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
     }
 
-    let out = Command::new(bin())
+    let out = command_with_home(home.path())
         .args(["uninstall", "--purge-data"]) // dry-run: no --apply
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         // Dry-run still hits the purge guard before previewing; opt out so an
         // unrelated live `ai-memory` can't flake the preview.
@@ -478,7 +733,7 @@ fn uninstall_dry_run_previews_purge() {
 /// Best-effort, NOT in the default run (sysinfo reads the real process table;
 /// no injection seam). Spawns a real sibling `ai-memory` process and asserts
 /// `--purge-data` refuses up front, leaving the wiring intact. Run with:
-/// `cargo test -p ai-memory-cli --test uninstall -- --ignored`.
+/// `cargo test -p ai-memory-cli --test removal -- --ignored`.
 #[test]
 #[ignore]
 fn purge_data_refuses_when_sibling_alive() {
@@ -492,17 +747,15 @@ fn purge_data_refuses_when_sibling_alive() {
     std::fs::write(&settings, original).unwrap();
 
     // Long-lived sibling `ai-memory` process.
-    let mut serve = Command::new(bin())
+    let mut serve = command_with_home(home.path())
         .arg("serve")
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(800));
 
-    let out = Command::new(bin())
+    let out = command_with_home(home.path())
         .args(["uninstall", "--apply", "--yes", "--purge-data"])
-        .env("HOME", home.path())
         .env("AI_MEMORY_DATA_DIR", data.path())
         .output()
         .unwrap();

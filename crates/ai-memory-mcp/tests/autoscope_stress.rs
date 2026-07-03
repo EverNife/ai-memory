@@ -19,7 +19,8 @@
 
 use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorContext};
 use ai_memory_hooks::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, hook_router,
+    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, SubagentSessionSet,
+    hook_router,
 };
 use ai_memory_mcp::AiMemoryServer;
 use ai_memory_store::Store;
@@ -156,6 +157,7 @@ impl Harness {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             consolidate_on_session_end: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             home_dir: None,
         });
 
@@ -1058,10 +1060,21 @@ async fn fire_raw_hook_and_settle(
         "agent-shape hook must accept"
     );
     let _ = response_body_text(resp).await;
-    for _ in 0..20 {
+    let expected = number_word(project_index);
+    for _ in 0..200 {
         tokio::task::yield_now().await;
+        let probe = router
+            .clone()
+            .oneshot(mcp_query_request(None, Some(session_id)))
+            .await
+            .expect("agent-shape settle probe");
+        if probe.status() == StatusCode::OK
+            && extract_tool_text(&response_body_text(probe).await).contains(expected)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    tokio::time::sleep(Duration::from_millis(15)).await;
 }
 
 async fn read_session_marker(router: &Router, session_id: &str) -> String {

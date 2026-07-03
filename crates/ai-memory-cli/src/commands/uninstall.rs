@@ -11,8 +11,12 @@ use crate::cli::UninstallArgs;
 use crate::commands::apply_shared::apply_atomic;
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
+use crate::commands::path_util::home_dir;
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
+use ai_memory_core::routing_skills::{
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+};
 use ai_memory_core::{MARKER_END, MARKER_START};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -37,20 +41,24 @@ enum RewriteOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteKind {
     OpenCodePlugin,
+    PiExtension,
     OmpExtension,
     OpenClawPackageJson,
     OpenClawManifest,
     OpenClawEntrypoint,
+    ManagedSkill,
 }
 
 impl DeleteKind {
     const fn label(self) -> &'static str {
         match self {
             Self::OpenCodePlugin => "OpenCode plugin",
+            Self::PiExtension => "Pi extension",
             Self::OmpExtension => "OMP extension",
             Self::OpenClawPackageJson => "OpenClaw package manifest",
             Self::OpenClawManifest => "OpenClaw plugin manifest",
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
+            Self::ManagedSkill => "managed Agent Skill",
         }
     }
 }
@@ -155,6 +163,9 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         let omp = install_hooks::omp_extension_path()?;
         push_generated_delete(&mut plan, omp, DeleteKind::OmpExtension);
 
+        let pi = install_hooks::pi_extension_path()?;
+        push_generated_delete(&mut plan, pi, DeleteKind::PiExtension);
+
         let openclaw_dir = openclaw_plugin::default_plugin_dir()?;
         push_generated_delete(
             &mut plan,
@@ -184,7 +195,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             ClaudeDesktop,
             GeminiCli,
             Openclaw,
-            Pi,
+            Omp,
             AntigravityCli,
             VsCodeCopilot,
         ] {
@@ -232,7 +243,39 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         }
     }
 
+    // ---- Managed Agent Skills (project + global roots) ----
+    if want(crate::cli::UninstallOnly::Skills) {
+        let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
+        let home = home_dir();
+        for root in skill_roots(&cwd, home.as_deref()) {
+            for skill in MANAGED_SKILLS {
+                push_generated_delete(
+                    &mut plan,
+                    root.join(skill.relative_path),
+                    DeleteKind::ManagedSkill,
+                );
+            }
+        }
+    }
+
     Ok(plan)
+}
+
+fn skill_roots(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(4);
+    push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
+    if let Some(home) = home {
+        push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
+        push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
+    }
+    roots
+}
+
+fn push_unique_skill_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if !roots.iter().any(|existing| existing == &root) {
+        roots.push(root);
+    }
 }
 
 /// Print the plan, one line per file, mirroring `reset`'s dry-run style.
@@ -276,6 +319,9 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
             }
             std::fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))?;
             println!("✓ deleted {}", path.display());
+            if *kind == DeleteKind::ManagedSkill {
+                remove_empty_skill_dirs(path)?;
+            }
         }
         PlannedChange::Rewrite { path, ops, .. } => {
             let outcome = apply_atomic(path, |existing| {
@@ -296,6 +342,36 @@ fn apply_change(change: &PlannedChange, name: Option<&str>, url: &str) -> anyhow
             println!("✓ {} {}", outcome.verb(), path.display());
         }
     }
+    Ok(())
+}
+
+fn remove_empty_skill_dirs(skill_file: &Path) -> Result<()> {
+    let Some(skill_dir) = skill_file.parent() else {
+        return Ok(());
+    };
+    let root = skill_dir.parent().map(Path::to_path_buf);
+
+    remove_dir_if_empty(skill_dir)?;
+    if let Some(root) = root {
+        remove_dir_if_empty(&root)?;
+    }
+
+    Ok(())
+}
+
+fn remove_dir_if_empty(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+
+    let mut entries =
+        std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?;
+    if entries.next().is_some() {
+        return Ok(());
+    }
+
+    std::fs::remove_dir(path).with_context(|| format!("removing {}", path.display()))?;
+    println!("✓ removed empty directory {}", path.display());
     Ok(())
 }
 
@@ -423,6 +499,27 @@ fn hook_command_is_ours(command: &str) -> bool {
         && lower.contains(" --server-url ")
 }
 
+fn hook_entry_is_ours(entry: &serde_json::Value) -> bool {
+    let Some(command) = entry.get("command").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    if hook_command_is_ours(command) {
+        return true;
+    }
+    let lower = command.to_ascii_lowercase();
+    if !(lower.contains("ai-memory") || lower.contains("ai_memory")) {
+        return false;
+    }
+    let Some(args) = entry.get("args").and_then(|a| a.as_array()) else {
+        return false;
+    };
+    let tokens: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+    tokens.contains(&"hook")
+        && tokens.contains(&"--event")
+        && tokens.contains(&"--agent")
+        && tokens.contains(&"--server-url")
+}
+
 /// Result of stripping ai-memory entries from a hooks JSON file.
 struct HookRemoval {
     new_content: String,
@@ -433,18 +530,12 @@ struct HookRemoval {
 /// remove_entry)`. Flat entries are removed whole; nested entries only lose the
 /// matching inner commands and survive when third-party inner hooks remain.
 fn strip_hook_entry(entry: &mut serde_json::Value) -> (bool, bool) {
-    if let Some(cmd) = entry.get("command").and_then(|c| c.as_str())
-        && hook_command_is_ours(cmd)
-    {
+    if hook_entry_is_ours(entry) {
         return (true, true);
     }
     if let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
         let before = inner.len();
-        inner.retain(|h| {
-            !h.get("command")
-                .and_then(|c| c.as_str())
-                .is_some_and(hook_command_is_ours)
-        });
+        inner.retain(|h| !hook_entry_is_ours(h));
         let removed = inner.len() != before;
         return (removed, inner.is_empty());
     }
@@ -542,6 +633,11 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
             content.contains("Auto-generated by `ai-memory install-hooks --agent omp --apply`")
                 && content.contains("const AGENT = \"omp\";")
         }
+        DeleteKind::PiExtension => {
+            content.contains("Auto-generated by `ai-memory install-hooks --agent pi --apply`")
+                && content.contains("const AGENT = \"pi\";")
+                && content.contains("pi.registerTool")
+        }
         DeleteKind::OpenClawEntrypoint => {
             content.contains("Auto-generated by `ai-memory install-hooks --agent openclaw --apply`")
                 && content.contains("definePluginEntry")
@@ -577,6 +673,7 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                         .and_then(|additional| additional.as_bool())
                         == Some(false)
             }),
+        DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
     }
 }
 
@@ -588,12 +685,12 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::ClaudeDesktop
         | McpClient::Cursor
         | McpClient::GeminiCli
-        | McpClient::Pi
+        | McpClient::Omp
         | McpClient::AntigravityCli => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
-        McpClient::Codex => None,
+        McpClient::Codex | McpClient::Pi => None,
     }
 }
 
@@ -884,6 +981,53 @@ mod tests {
     }
 
     #[test]
+    fn strip_hooks_removes_exec_form_ours_preserves_exec_third_party_and_sibling() {
+        let content = r#"{
+      "hooks": {
+        "SessionStart": [
+          {"matcher":"","hooks":[
+            {"type":"command","command":"C:\\bin\\ai-memory.exe","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]},
+            {"type":"command","command":"C:\\bin\\third-party.exe","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]}
+          ]},
+          {"matcher":"Tool","hooks":[
+            {"type":"command","command":"C:\\bin\\other.exe","args":["--keep"]}
+          ]}
+        ],
+        "Stop": [
+          {"matcher":"","hooks":[{"type":"command","command":"\"C:\\bin\\ai-memory.exe\" hook --event stop --agent claude-code --server-url \"http://h\""}]}
+        ]
+      }
+    }"#;
+
+        let out = strip_ai_memory_hooks(content).unwrap();
+        assert_eq!(
+            out.removed_events,
+            vec!["SessionStart".to_string(), "Stop".to_string()]
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert!(
+            v["hooks"].get("Stop").is_none(),
+            "legacy string hook removed"
+        );
+        let entries = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "outer sibling group preserved");
+        let first_inner = entries[0]["hooks"].as_array().unwrap();
+        assert_eq!(
+            first_inner.len(),
+            1,
+            "only ai-memory inner exec hook removed"
+        );
+        assert_eq!(
+            first_inner[0]["command"].as_str(),
+            Some(r"C:\bin\third-party.exe")
+        );
+        assert_eq!(
+            entries[1]["hooks"][0]["command"].as_str(),
+            Some(r"C:\bin\other.exe")
+        );
+    }
+
+    #[test]
     fn strip_hooks_no_hooks_key_is_noop() {
         let content = r#"{"unrelated":true}"#;
         let out = strip_ai_memory_hooks(content).unwrap();
@@ -1084,11 +1228,11 @@ mod tests {
     }
 
     #[test]
-    fn strip_mcp_pi_root_servers() {
+    fn strip_mcp_omp_root_servers() {
         let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp","enabled":true}}}"#;
         let (out, removed) = strip_mcp_json(
             content,
-            McpClient::Pi,
+            McpClient::Omp,
             Some("ai-memory"),
             "http://127.0.0.1:49374/mcp",
         )

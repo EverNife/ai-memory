@@ -7,6 +7,162 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The detached drainer's `logs/hook-drain.log` now rotates once it exceeds
+  1 MiB (previous contents move to `hook-drain.log.old`), so an agent
+  pointed at a chronically unreachable server can no longer grow the log
+  without bound.
+- Windows hook-spool drain locks now treat native lock-violation responses as
+  expected lock contention, so overlapping background drains skip cleanly
+  instead of failing the single-flight guard.
+- Windows wiki checkpoints now fall back to the Git CLI for native libgit2
+  path-resolution failures when reopening freshly initialised repos, keeping
+  delete and purge operations usable under dot-prefixed temp or wrapper paths.
+
+### Changed
+- Post-audit cleanup, no behavior change: the `AI_MEMORY_HOOK_PLATFORM`
+  override is parsed in one place instead of three copies, the CLI
+  `AgentChoice` → domain `AgentKind` mapping is a single `kind()` method
+  instead of three per-command match blocks, the companion importer crate
+  is now gated in CI (fmt/clippy/test), and
+  `crates/ai-memory-store/src/auto_improve.rs` is fully documented (its
+  file-wide `missing_docs` allowance is gone). `AI_MEMORY_HOOKS_HOST_ROOT`
+  is now documented in `docs/install.md`.
+
+## [1.7.1] - 2026-07-02
+
+### Fixed
+- Acknowledged the new `quick-xml` RustSec advisories in CI for the existing
+  `syntect` transitive dependency bucket. `plist` still constrains `quick-xml`
+  below the fixed 0.41.x branch, and ai-memory does not parse untrusted XML in
+  this path; the ignores keep cargo-audit/cargo-deny focused on actionable
+  advisories until the upstream dependency chain can update.
+
+## [1.7.0] - 2026-07-02
+
+### Added
+- Added `ai-memory finalize-session`, a supported manual Codex finalization
+  flow. It defaults to the latest open Codex session in the current
+  workspace/project and posts a synthetic `session-end` hook so summaries,
+  handoffs, and auto-improvement eligibility use the canonical SessionEnd path.
+
+### Fixed
+- Native hook spool delivery no longer relies only on the cancellation-prone
+  `session-end` hook to start the detached drainer. `stop` and `pre-compact`
+  also request the background `hook-drain` helper after enqueue, and Unix builds
+  use a trusted `setsid` launcher when available before falling back to a
+  separate process group.
+- OpenCode generated plugins now close sessions from the official
+  `session.deleted` event and a deduped best-effort `dispose` fallback, so
+  OpenCode sessions can produce automatic session summaries and handoffs without
+  duplicate `session-end` emissions.
+
+## [1.6.0] - 2026-07-01
+
+### Fixed
+- Documented and regression-tested that `install-instructions` updates only the
+  ai-memory marker block, preserves unrelated CLAUDE.md / AGENTS.md content,
+  writes backups for existing files, and refuses unmanaged same-name skills
+  unless explicitly forced.
+- Claude Code WindowsNative hook installs now use Claude's exec form
+  (`command` executable plus `args` argv array) for the native `ai-memory.exe`
+  hook, avoiding shell/Git Bash/PowerShell command-string mangling. Set
+  `AI_MEMORY_HOOK_PLATFORM=windows-bash` before `install-hooks` as a fallback for
+  older Claude Code builds; exec form requires a real `.exe`, not `.cmd`/`.bat`
+  shims.
+- Native `session-end` hooks now enqueue and return quickly, then drain the hook
+  spool through a hidden detached `hook-drain` process guarded by a real
+  single-flight file lock. Background drains use the new bounded
+  `AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES` setting (default 5, max 60),
+  while `session-start` cleanup remains synchronous and uses one shared
+  `AI_MEMORY_HOOK_START_BUDGET_MINUTES` budget for lock wait plus cleanup drain.
+  This supersedes the previous inline `session-end` deferred-drain note and
+  `AI_MEMORY_HOOK_END_BUDGET_MINUTES` session-end flush budget.
+- Pi is now supported through a generated `~/.pi/agent/extensions/ai-memory.ts`
+  TypeScript extension that combines lifecycle capture with an HTTP MCP bridge;
+  `install-hooks --agent pi --apply` writes it, while `install-mcp --client pi`
+  prints bridge guidance instead of writing an ignored native `mcp.json`.
+- Generated OpenCode and OMP TypeScript lifecycle hooks now buffer capture
+  posts through a bounded best-effort queue instead of spawning one unbounded
+  fetch per event, reducing client-side request bursts while preserving direct
+  handoff fetches.
+- Corrected the Pi vs Oh My Pi / OMP install split: OMP remains supported via
+  `--client omp` / `--agent omp` (or `oh-my-pi`) and writes `.omp` config, while
+  real `pi` remains a separate install surface. Users who previously used `pi`
+  to mean OMP should switch to `omp` or `oh-my-pi`.
+
+## [1.5.0] - 2026-07-01
+
+### Added
+- Per-project `drop_subagent_captures` opt-in. A project sets
+  `drop_subagent_captures = "true"` in its `.ai-memory.toml`; the host-side hook
+  forwards it (as the `drop_subagent` query flag, alongside the existing
+  `workspace`/`project`/`project_strategy` marker fields) so the ingest router
+  **accepts but does not persist** that project's subagent-session captures,
+  keeping only top-level sessions. A multi-agent harness fans one goal out to
+  many subagent sessions, each firing lifecycle hooks; on a small shared
+  instance that flood can saturate ingest and bloat the store. Scoping the
+  opt-in to the project that asked for it avoids a server-global switch that
+  would shed subagent captures for every project on the instance. Captures are
+  accepted (HTTP 202 / counted in the `/hook/batch` ack) so clients do not retry
+  or spool them, but they are not stored. Detection combines a per-event marker
+  (`subagentType` for grok, `agent_type`/`agent_id` for Claude Code) with
+  stateful, bounded tracking of subagent session ids: the router seeds the set
+  from any marked event and from the newly registered
+  `SubagentStart`/`SubagentStop` lifecycle hooks (claude-code and grok), and
+  clears it on `SubagentStop`, so the unmarked tail of a subagent session (its
+  `user_prompt_submit`/`stop`/`session_end`, which carry no marker) is dropped
+  too — not just the marker-bearing tool-use events.
+
+### Fixed
+- Native Windows/Git Bash installs now normalize hook cwd, stored project
+  `repo_path`, and the home-directory guard consistently across slash styles,
+  including legacy rows persisted with backslashes. `AI_MEMORY_HOME` now feeds
+  the same home guard as `$HOME`, and Git-backed helpers preserve bare-repo
+  fallback semantics while limiting CLI git fallbacks to path/open failures.
+
+## [1.4.1] - 2026-06-28
+
+## [1.4.0] - 2026-06-26
+
+### Changed
+- `install-instructions` now refreshes a slim markered CLAUDE.md/AGENTS.md
+  snippet and installs or updates managed ai-memory Agent Skills by default,
+  with `--no-skills` for snippet-only refreshes and `--skills-*` flags for
+  scope, agent family, target root, and forced unmanaged replacement. Added
+  `install-skills` for refreshing those prompt-packaging skills directly, and
+  `memory_install_self_routing` now returns the slim block, managed skill
+  payloads, target hints, and overwrite guidance for agents that install
+  routing through MCP.
+
+### Added
+- The native `session-end` hook now emits a one-line stderr note when the spool
+  drain leaves events queued for a later boundary: it reports how many events
+  were flushed, how many remain queued, whether any events were dropped as
+  undeliverable, and names the knobs to bound the backlog
+  (`AI_MEMORY_HOOK_END_BUDGET_MINUTES`, `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD`),
+  turning an otherwise silent, scary cancelled-hook symptom into an actionable,
+  self-documenting message. A fully-drained session stays silent. (#130)
+- `ai-memory uninstall --only skills` now removes ai-memory-managed Agent Skill
+  files from the default project/global `.claude/skills` and `.agents/skills`
+  roots after marker validation; custom `--target-dir` skill roots remain a
+  manual cleanup path.
+
+### Changed
+- Agent-facing routing prompts and auto-scope docs now call out that static MCP
+  clients running parallel sessions need explicit scope arguments or a
+  session-aware bridge that forwards the real lifecycle-hook session id.
+
+### Fixed
+- Thin-client HTTP CLI commands (`status`, `search`, `read-page`, `write-page`,
+  `delete-page`, `backup`, `embed`, and related admin commands) now fall back to
+  a stored OIDC device-flow token from `auth.json` when `AI_MEMORY_AUTH_TOKEN` /
+  `[auth].bearer_token` is absent. This sends a bearer for external OIDC-aware
+  gateways/bridges; native ai-memory server auth still uses the static root
+  bearer or DB-user tokens, and `/admin/*` remains root-only unless a gateway
+  translates accepted OIDC auth into upstream auth that ai-memory accepts.
+  Static bearer tokens still take precedence.
+
 ## [1.3.0] - 2026-06-24
 
 ### Added
@@ -1367,7 +1523,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.7.1...HEAD
+[1.7.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.7.1
+[1.7.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.7.0
+[1.6.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.6.0
+[1.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.5.0
+[1.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.4.1
+[1.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.4.0
 [1.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.3.0
 [1.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.2.2
 [1.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.2.1
